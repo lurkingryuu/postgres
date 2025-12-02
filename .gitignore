@@ -46,3 +46,7 @@ lib*.pc
 
 # Build directories
 builddir/
+
+# VSCode
+.vscode/
+.cursor/
