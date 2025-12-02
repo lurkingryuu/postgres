@@ -77,13 +77,110 @@
 #include "parser/parse_type.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
+#include "lib/stringinfo.h"
 #include "utils/aclchk_internal.h"
+#include "utils/authorization_hook.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+
+/*
+ * Universal authorization hook for external authorization plugins.
+ * This hook is called during ACL checks and allows extensions to
+ * intercept and control authorization decisions.
+ */
+universal_authorization_hook_type universal_authorization_hook = NULL;
+
+/*
+ * Helper functions for authorization hook
+ */
+void
+InitAuthorizationInfo(AuthorizationInfo *info, AuthorizationEventType event_type, Oid roleid)
+{
+	memset(info, 0, sizeof(AuthorizationInfo));
+	info->event_type = event_type;
+	info->roleid = roleid;
+	info->dboid = MyDatabaseId;
+}
+
+const char *
+GetAuthorizationEventTypeName(AuthorizationEventType event_type)
+{
+	switch (event_type)
+	{
+		case PG_AUTH_EVENT_DML:
+			return "DML";
+		case PG_AUTH_EVENT_DDL:
+			return "DDL";
+		case PG_AUTH_EVENT_UTILITY:
+			return "UTILITY";
+		case PG_AUTH_EVENT_OBJECT_ACCESS:
+			return "OBJECT_ACCESS";
+		case PG_AUTH_EVENT_ROLE_CHECK:
+			return "ROLE_CHECK";
+		case PG_AUTH_EVENT_ACL_CHECK:
+			return "ACL_CHECK";
+		default:
+			return "UNKNOWN";
+	}
+}
+
+const char *
+GetAuthorizationResultName(AuthorizationResult result)
+{
+	switch (result)
+	{
+		case PG_AUTH_RESULT_GRANT:
+			return "GRANT";
+		case PG_AUTH_RESULT_DENY:
+			return "DENY";
+		case PG_AUTH_RESULT_IGNORE:
+			return "IGNORE";
+		default:
+			return "UNKNOWN";
+	}
+}
+
+char *
+AclModeToPrivilegeString(AclMode mode)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+
+	if (mode & ACL_INSERT)
+		appendStringInfo(&buf, "%sINSERT", buf.len > 0 ? ", " : "");
+	if (mode & ACL_SELECT)
+		appendStringInfo(&buf, "%sSELECT", buf.len > 0 ? ", " : "");
+	if (mode & ACL_UPDATE)
+		appendStringInfo(&buf, "%sUPDATE", buf.len > 0 ? ", " : "");
+	if (mode & ACL_DELETE)
+		appendStringInfo(&buf, "%sDELETE", buf.len > 0 ? ", " : "");
+	if (mode & ACL_TRUNCATE)
+		appendStringInfo(&buf, "%sTRUNCATE", buf.len > 0 ? ", " : "");
+	if (mode & ACL_REFERENCES)
+		appendStringInfo(&buf, "%sREFERENCES", buf.len > 0 ? ", " : "");
+	if (mode & ACL_TRIGGER)
+		appendStringInfo(&buf, "%sTRIGGER", buf.len > 0 ? ", " : "");
+	if (mode & ACL_EXECUTE)
+		appendStringInfo(&buf, "%sEXECUTE", buf.len > 0 ? ", " : "");
+	if (mode & ACL_USAGE)
+		appendStringInfo(&buf, "%sUSAGE", buf.len > 0 ? ", " : "");
+	if (mode & ACL_CREATE)
+		appendStringInfo(&buf, "%sCREATE", buf.len > 0 ? ", " : "");
+	if (mode & ACL_CREATE_TEMP)
+		appendStringInfo(&buf, "%sTEMPORARY", buf.len > 0 ? ", " : "");
+	if (mode & ACL_CONNECT)
+		appendStringInfo(&buf, "%sCONNECT", buf.len > 0 ? ", " : "");
+
+	if (buf.len == 0)
+		appendStringInfoString(&buf, "NONE");
+
+	return buf.data;
+}
 
 /*
  * Internal format used by ALTER DEFAULT PRIVILEGES.
