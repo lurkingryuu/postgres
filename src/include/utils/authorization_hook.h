@@ -77,6 +77,7 @@ typedef struct PgAuthDDLInfo
 	const char *command_tag;	/* Command tag (e.g., "CREATE TABLE") */
 	int			subid;			/* Sub-object ID (e.g., column number) */
 	bool		is_internal;	/* Is this an internal operation? */
+	AclMode		required_perms; /* Required permissions (for ACL checks) */
 } PgAuthDDLInfo;
 
 /*

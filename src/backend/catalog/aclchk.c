@@ -3286,6 +3286,41 @@ object_aclmask_ext(Oid classid, Oid objectid, Oid roleid,
 
 	ReleaseSysCache(tuple);
 
+	/*
+	 * Universal Authorization Hook
+	 *
+	 * If the native authorization system hasn't granted all requested permissions,
+	 * consult the external authorization hook.
+	 */
+	if (universal_authorization_hook)
+	{
+		bool		sufficient;
+
+		if (how == ACLMASK_ALL)
+			sufficient = (result & mask) == mask;
+		else
+			sufficient = (result & mask) != 0;
+
+		if (!sufficient)
+		{
+			AuthorizationInfo auth_info;
+			AuthorizationResult hook_result;
+
+			InitAuthorizationInfo(&auth_info, PG_AUTH_EVENT_ACL_CHECK, roleid);
+			auth_info.info.ddl.classid = classid;
+			auth_info.info.ddl.objectid = objectid;
+			auth_info.info.ddl.required_perms = mask;
+
+			hook_result = universal_authorization_hook(&auth_info);
+
+			if (hook_result == PG_AUTH_RESULT_GRANT)
+			{
+				/* Hook granted access - grant all requested permissions */
+				result |= mask;
+			}
+		}
+	}
+
 	return result;
 }
 
@@ -3554,6 +3589,41 @@ pg_class_aclmask_ext(Oid table_oid, Oid roleid, AclMode mask,
 		!(result & ACL_MAINTAIN) &&
 		has_privs_of_role(roleid, ROLE_PG_MAINTAIN))
 		result |= ACL_MAINTAIN;
+
+	/*
+	 * Universal Authorization Hook
+	 *
+	 * If the native authorization system hasn't granted all requested permissions,
+	 * consult the external authorization hook.
+	 */
+	if (universal_authorization_hook)
+	{
+		bool		sufficient;
+
+		if (how == ACLMASK_ALL)
+			sufficient = (result & mask) == mask;
+		else
+			sufficient = (result & mask) != 0;
+
+		if (!sufficient)
+		{
+			AuthorizationInfo auth_info;
+			AuthorizationResult hook_result;
+
+			InitAuthorizationInfo(&auth_info, PG_AUTH_EVENT_ACL_CHECK, roleid);
+			auth_info.info.ddl.classid = RelationRelationId;
+			auth_info.info.ddl.objectid = table_oid;
+			auth_info.info.ddl.required_perms = mask;
+
+			hook_result = universal_authorization_hook(&auth_info);
+
+			if (hook_result == PG_AUTH_RESULT_GRANT)
+			{
+				/* Hook granted access - grant all requested permissions */
+				result |= mask;
+			}
+		}
+	}
 
 	return result;
 }
