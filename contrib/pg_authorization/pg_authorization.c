@@ -38,6 +38,7 @@
 #include "access/table.h"
 #include "catalog/objectaccess.h"
 #include "utils/rel.h"
+#include "nodes/parsenodes.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
@@ -655,6 +656,20 @@ static bool cedar_sync_entity_delete(const char *entity_type,
                         entity_type, entity_id)));
       stats_sync_successes++;
       success = true;
+    } else if (response_code == 404) {
+      /*
+       * Not Found - entity does not exist. Treat this as success for
+       * idempotency, matching the upsert behavior that treats HTTP 409 as
+       * success. This commonly occurs during teardown (DROP ... IF EXISTS)
+       * when the Cedar Agent has no prior state for the entity.
+       */
+      if (cedar_log_decisions)
+        ereport(LOG,
+                (errmsg("pg_authorization: entity %s:\"%s\" not found "
+                        "(HTTP 404), treating as success",
+                        entity_type, entity_id)));
+      stats_sync_successes++;
+      success = true;
     } else {
       ereport(WARNING,
               (errmsg("pg_authorization: entity delete returned HTTP %ld",
@@ -951,8 +966,24 @@ static void cedar_object_access_hook(ObjectAccessType access, Oid classId,
     switch (classId) {
     case RelationRelationId:
       /* Table/Relation */
-      entity_type = "Table";
       {
+        char relkind = get_rel_relkind(objectId);
+
+        /* If syscache lookup fails (e.g. during OAT_POST_CREATE), try opening relation */
+        if (relkind == '\0') {
+          Relation rel = relation_open(objectId, NoLock);
+          relkind = rel->rd_rel->relkind;
+          relation_close(rel, NoLock);
+        }
+
+        /* Filter out indexes, sequences, toast tables, etc. */
+        if (relkind != RELKIND_RELATION && 
+            relkind != RELKIND_VIEW &&
+            relkind != RELKIND_MATVIEW &&
+            relkind != RELKIND_PARTITIONED_TABLE)
+          break;
+
+        entity_type = "Table";
         char *rel_name = get_rel_name(objectId);
         Oid namespace_oid = InvalidOid;
 
@@ -1105,6 +1136,33 @@ cedar_process_utility_hook(PlannedStmt *pstmt, const char *queryString,
   else
     standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
                             queryEnv, dest, qc);
+
+  /*
+   * Entity sync fallback for roles/users.
+   *
+   * In core Postgres, role creation invokes object_access_hook via
+   * InvokeObjectPostCreateHook(AuthIdRelationId, roleid, 0) (see user.c),
+   * but the catalog tuple may not be visible via syscache at that moment.
+   * That means our OAT_POST_CREATE path can fail to resolve the rolename and
+   * we end up not creating the corresponding Cedar entity.
+   *
+   * ProcessUtility_hook sees the parsed CreateRoleStmt (with the role name)
+   * and runs after the command has executed, so it's a reliable place to
+   * perform the upsert and match MySQL ddl_audit behavior.
+   */
+  if (cedar_entity_sync_enabled &&
+      cedar_agent_url != NULL && cedar_agent_url[0] != '\0' &&
+      pstmt != NULL && pstmt->utilityStmt != NULL) {
+    Node *parsetree = (Node *) pstmt->utilityStmt;
+
+    if (IsA(parsetree, CreateRoleStmt)) {
+      CreateRoleStmt *stmt = (CreateRoleStmt *) parsetree;
+
+      if (stmt->role && stmt->role[0] != '\0') {
+        cedar_sync_entity_upsert("User", stmt->role);
+      }
+    }
+  }
 }
 
 /* --------------------------------------------------------------------------
