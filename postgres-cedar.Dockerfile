@@ -48,7 +48,11 @@ RUN ./configure \
     --enable-debug \
     --enable-cassert \
     && make -j$(nproc) \
-    && make install
+    && make -j$(nproc) -C contrib \
+    && make install \
+    && make -C contrib install \
+    && cp cedar_auth.control /usr/local/pgsql/share/extension/ \
+    && cp cedar_auth--1.0.sql /usr/local/pgsql/share/extension/
 
 # Final stage: Use the official PostgreSQL 17.7 image as base
 # This provides the entrypoint, default configuration, and standard environment

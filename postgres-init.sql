@@ -8,9 +8,9 @@ SELECT 'CREATE DATABASE abac_test' WHERE NOT EXISTS (SELECT FROM pg_database WHE
 \c abac_test;
 
 -- Create test users
-CREATE USER IF NOT EXISTS user_alice;
-CREATE USER IF NOT EXISTS user_bob;
-CREATE USER IF NOT EXISTS user_charlie;
+CREATE USER user_alice;
+CREATE USER user_bob;
+CREATE USER user_charlie;
 
 -- Create test tables
 CREATE TABLE IF NOT EXISTS projects (
@@ -76,15 +76,18 @@ ON CONFLICT DO NOTHING;
 -- This will only work on the modified PostgreSQL with hooks
 DO $$
 BEGIN
-    -- Try to create extension, ignore if it doesn't exist
+    -- Try to create extensions, ignore if they don't exist
     BEGIN
         CREATE EXTENSION IF NOT EXISTS cedar_auth;
     EXCEPTION
-        WHEN undefined_function THEN
-            RAISE NOTICE 'Cedar authorization extension not available (expected on baseline)';
-        WHEN undefined_file THEN
-            RAISE NOTICE 'Cedar authorization extension files not found (expected on baseline)';
         WHEN OTHERS THEN
-            RAISE NOTICE 'Error creating Cedar extension: %', SQLERRM;
+            RAISE NOTICE 'Note: cedar_auth extension not available or failed: %', SQLERRM;
+    END;
+
+    BEGIN
+        CREATE EXTENSION IF NOT EXISTS pg_authorization;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE NOTICE 'Note: pg_authorization extension not available or failed: %', SQLERRM;
     END;
 END $$;

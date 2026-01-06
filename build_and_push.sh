@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build and push Cedar PostgreSQL Docker image
-# This script builds the modified PostgreSQL with Cedar authorization hooks
+# Build and push multi-arch Cedar PostgreSQL Docker image
+# This script builds the modified PostgreSQL with Cedar authorization hooks for multiple architectures
 
 set -e  # Exit on any error
 
@@ -44,21 +44,28 @@ for file in "${REQUIRED_FILES[@]}"; do
 done
 echo ""
 
-# Build the Docker image (with progress output and BuildKit)
-echo "Building Docker image..."
-echo "Command: DOCKER_BUILDKIT=1 docker build --load -f postgres-cedar.Dockerfile -t ${FULL_IMAGE_NAME} ."
-echo "Note: This build can take 10-15 minutes. If it gets stuck, try Ctrl+C and run again."
-echo "Tip: Docker BuildKit enabled for faster builds. Fixed UUID library dependency issue."
-DOCKER_BUILDKIT=1 docker build --load -f postgres-cedar.Dockerfile -t "${FULL_IMAGE_NAME}" .
+# Set up buildx for multi-platform builds
+echo "Setting up buildx for multi-platform builds..."
+docker buildx use multiarch-postgres || docker buildx create --name multiarch-postgres --use --bootstrap
+
+# Build and push multi-arch Docker image
+echo "Building and pushing multi-arch Docker image..."
+echo "Platforms: linux/amd64, linux/arm64"
+echo "Command: docker buildx build --platform linux/amd64,linux/arm64 --push -f postgres-cedar.Dockerfile -t ${FULL_IMAGE_NAME} ."
+echo "Note: This multi-arch build can take 20-30 minutes. It builds for both AMD64 and ARM64 architectures."
+echo "Tip: Using buildx for faster multi-platform builds with BuildKit."
+docker buildx build --platform linux/amd64,linux/arm64 --push -f postgres-cedar.Dockerfile -t "${FULL_IMAGE_NAME}" .
 
 if [ $? -eq 0 ]; then
-    echo "✓ Docker image built successfully: ${FULL_IMAGE_NAME}"
+    echo "✓ Multi-arch Docker image built and pushed successfully: ${FULL_IMAGE_NAME}"
+    echo "  Platforms: linux/amd64, linux/arm64"
 else
-    echo "✗ Docker build failed"
+    echo "✗ Multi-arch Docker build failed"
     echo ""
     echo "🔧 Troubleshooting:"
     echo "Run './troubleshoot_build.sh' for diagnostics"
-    echo "Or try: docker system prune -f && ./build_and_push.sh"
+    echo "Or try: docker buildx prune -f && ./build_and_push.sh"
+    echo "Or check buildx setup: docker buildx ls"
     exit 1
 fi
 echo ""
@@ -74,21 +81,11 @@ if [ "${SKIP_TEST:-false}" != "true" ]; then
     echo ""
 fi
 
-# Push the image
-echo "Pushing Docker image to registry..."
-echo "Command: docker push ${FULL_IMAGE_NAME}"
-docker push "${FULL_IMAGE_NAME}"
-
-if [ $? -eq 0 ]; then
-    echo "✓ Docker image pushed successfully: ${FULL_IMAGE_NAME}"
-else
-    echo "✗ Docker push failed"
-    exit 1
-fi
-echo ""
+# Note: Push is handled by buildx build --push above
 
 # Success message
-echo "🎉 Build and push completed successfully!"
+echo "🎉 Multi-arch build and push completed successfully!"
+echo "The image ${FULL_IMAGE_NAME} now supports both AMD64 and ARM64 architectures."
 echo ""
 echo "Next steps:"
 echo "1. Set the environment variable in your experiments:"
