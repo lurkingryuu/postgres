@@ -59,10 +59,14 @@ RUN ./configure \
 FROM postgres:17.7
 
 # Install additional runtime dependencies that might not be in the base image
+# CRITICAL: libcurl4 is required for the pg_authorization extension
 RUN apt-get update && apt-get install -y \
     libxslt1.1 \
     libselinux1 \
     libuuid1 \
+    libxml2 \
+    libcurl4 \
+    libicu76 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy our built PostgreSQL over the existing one or to a separate prefix
@@ -76,8 +80,19 @@ ENV PGDATA=/var/lib/postgresql/data
 # Ensure the postgres user owns the new files
 RUN chown -R postgres:postgres /usr/local/pgsql
 
-# Update shared library cache
-RUN echo "/usr/local/pgsql/lib" > /etc/ld.so.conf.d/postgres.conf && ldconfig
+# Update shared library cache and ensure our lib directory is searched
+RUN echo "/usr/local/pgsql/lib" > /etc/ld.so.conf.d/00-postgres-custom.conf && ldconfig
+
+# Also symlink our built PostgreSQL components to the official locations.
+# This ensures that the official image's entrypoint and scripts find our modified
+# versions instead of the standard ones.
+RUN mkdir -p /usr/lib/postgresql/17/lib/ && \
+    ln -sf /usr/local/pgsql/lib/pg_authorization.so /usr/lib/postgresql/17/lib/pg_authorization.so && \
+    mkdir -p /usr/share/postgresql/17/extension/ && \
+    ln -sf /usr/local/pgsql/share/extension/pg_authorization* /usr/share/postgresql/17/extension/ && \
+    ln -sf /usr/local/pgsql/share/extension/cedar_auth* /usr/share/postgresql/17/extension/ && \
+    ln -sf /usr/local/pgsql/bin/postgres /usr/lib/postgresql/17/bin/postgres && \
+    ln -sf /usr/local/pgsql/bin/pg_config /usr/lib/postgresql/17/bin/pg_config
 
 # Copy initialization scripts (official image entrypoint uses this directory)
 COPY postgres-init.sql /docker-entrypoint-initdb.d/
