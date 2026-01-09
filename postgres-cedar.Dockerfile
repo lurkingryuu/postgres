@@ -39,14 +39,15 @@ COPY . /postgres-build/
 
 # Configure and build PostgreSQL
 # We use --with-uuid=e2fs which requires uuid-dev
+# Optimized build for production performance
 RUN ./configure \
     --prefix=/usr/local/pgsql \
     --with-openssl \
     --with-libxml \
     --with-libxslt \
     --with-uuid=e2fs \
-    --enable-debug \
-    --enable-cassert \
+    --enable-depend \
+    CFLAGS="-O2 -march=native -mtune=native" \
     && make -j$(nproc) \
     && make -j$(nproc) -C contrib \
     && make install \
