@@ -119,7 +119,7 @@ if [ ! -d "${BUILD_DIR}" ]; then
 else
   log "Existing builddir found, ensuring prefix=${PG_PREFIX} and reconfiguring..."
   cd "${BUILD_DIR}"
-  meson configure -Dprefix="${PG_PREFIX}"
+  meson configure -Dprefix="${PG_PREFIX}" -Dtap_tests=enabled
   meson setup --reconfigure ..
   cd "${PG_SRC_DIR}"
 fi

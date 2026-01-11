@@ -100,10 +100,23 @@ universal_authorization_hook_type universal_authorization_hook = NULL;
 void
 InitAuthorizationInfo(AuthorizationInfo *info, AuthorizationEventType event_type, Oid roleid)
 {
+	HeapTuple	tuple;
+
 	memset(info, 0, sizeof(AuthorizationInfo));
 	info->event_type = event_type;
 	info->roleid = roleid;
+
+	tuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
+	if (HeapTupleIsValid(tuple))
+	{
+		Form_pg_authid roleForm = (Form_pg_authid) GETSTRUCT(tuple);
+
+		info->rolename = pstrdup(NameStr(roleForm->rolname));
+		ReleaseSysCache(tuple);
+	}
+
 	info->dboid = MyDatabaseId;
+	info->dbname = get_database_name(MyDatabaseId);
 }
 
 const char *
@@ -3451,6 +3464,42 @@ pg_attribute_aclmask_ext(Oid table_oid, AttrNumber attnum, Oid roleid,
 
 	ReleaseSysCache(attTuple);
 
+	/*
+	 * Universal Authorization Hook
+	 *
+	 * If the native authorization system hasn't granted all requested permissions,
+	 * consult the external authorization hook.
+	 */
+	if (universal_authorization_hook)
+	{
+		bool		sufficient;
+
+		if (how == ACLMASK_ALL)
+			sufficient = (result & mask) == mask;
+		else
+			sufficient = (result & mask) != 0;
+
+		if (!sufficient)
+		{
+			AuthorizationInfo auth_info;
+			AuthorizationResult hook_result;
+
+			InitAuthorizationInfo(&auth_info, PG_AUTH_EVENT_ACL_CHECK, roleid);
+			auth_info.info.ddl.classid = RelationRelationId;
+			auth_info.info.ddl.objectid = table_oid;
+			auth_info.info.ddl.subid = attnum;
+			auth_info.info.ddl.required_perms = mask;
+
+			hook_result = universal_authorization_hook(&auth_info);
+
+			if (hook_result == PG_AUTH_RESULT_GRANT)
+			{
+				/* Hook granted access - grant all requested permissions */
+				result |= mask;
+			}
+		}
+	}
+
 	return result;
 }
 
@@ -3924,6 +3973,42 @@ pg_namespace_aclmask_ext(Oid nsp_oid, Oid roleid,
 		(has_privs_of_role(roleid, ROLE_PG_READ_ALL_DATA) ||
 		 has_privs_of_role(roleid, ROLE_PG_WRITE_ALL_DATA)))
 		result |= ACL_USAGE;
+
+	/*
+	 * Universal Authorization Hook
+	 *
+	 * If the native authorization system hasn't granted all requested permissions,
+	 * consult the external authorization hook.
+	 */
+	if (universal_authorization_hook)
+	{
+		bool		sufficient;
+
+		if (how == ACLMASK_ALL)
+			sufficient = (result & mask) == mask;
+		else
+			sufficient = (result & mask) != 0;
+
+		if (!sufficient)
+		{
+			AuthorizationInfo auth_info;
+			AuthorizationResult hook_result;
+
+			InitAuthorizationInfo(&auth_info, PG_AUTH_EVENT_ACL_CHECK, roleid);
+			auth_info.info.ddl.classid = NamespaceRelationId;
+			auth_info.info.ddl.objectid = nsp_oid;
+			auth_info.info.ddl.required_perms = mask;
+
+			hook_result = universal_authorization_hook(&auth_info);
+
+			if (hook_result == PG_AUTH_RESULT_GRANT)
+			{
+				/* Hook granted access - grant all requested permissions */
+				result |= mask;
+			}
+		}
+	}
+
 	return result;
 }
 
@@ -4049,6 +4134,41 @@ pg_type_aclmask_ext(Oid type_oid, Oid roleid, AclMode mask, AclMaskHow how,
 		pfree(acl);
 
 	ReleaseSysCache(tuple);
+
+	/*
+	 * Universal Authorization Hook
+	 *
+	 * If the native authorization system hasn't granted all requested permissions,
+	 * consult the external authorization hook.
+	 */
+	if (universal_authorization_hook)
+	{
+		bool		sufficient;
+
+		if (how == ACLMASK_ALL)
+			sufficient = (result & mask) == mask;
+		else
+			sufficient = (result & mask) != 0;
+
+		if (!sufficient)
+		{
+			AuthorizationInfo auth_info;
+			AuthorizationResult hook_result;
+
+			InitAuthorizationInfo(&auth_info, PG_AUTH_EVENT_ACL_CHECK, roleid);
+			auth_info.info.ddl.classid = TypeRelationId;
+			auth_info.info.ddl.objectid = type_oid;
+			auth_info.info.ddl.required_perms = mask;
+
+			hook_result = universal_authorization_hook(&auth_info);
+
+			if (hook_result == PG_AUTH_RESULT_GRANT)
+			{
+				/* Hook granted access - grant all requested permissions */
+				result |= mask;
+			}
+		}
+	}
 
 	return result;
 }

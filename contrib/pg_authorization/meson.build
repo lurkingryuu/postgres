@@ -31,3 +31,19 @@ install_data(
   kwargs: contrib_data_args,
 )
 
+tests += {
+  'name': 'pg_authorization',
+  'sd': meson.current_source_dir(),
+  'bd': meson.current_build_dir(),
+  'regress': {
+    'sql': [
+      'pg_authorization',
+    ],
+  },
+  'tap': {
+    'tests': [
+      't/001_basic.pl',
+    ],
+  },
+}
+

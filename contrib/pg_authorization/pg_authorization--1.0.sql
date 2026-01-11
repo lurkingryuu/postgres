@@ -61,6 +61,7 @@ CREATE VIEW pg_authorization_config AS
 SELECT
     current_setting('pg_authorization.cedar_agent_url', true) AS cedar_agent_url,
     current_setting('pg_authorization.timeout', true) AS timeout_ms,
+    current_setting('pg_authorization.namespace', true) AS cedar_namespace,
     current_setting('pg_authorization.enabled', true) AS authorization_enabled,
     current_setting('pg_authorization.entity_sync_enabled', true) AS entity_sync_enabled,
     current_setting('pg_authorization.log_decisions', true) AS log_decisions;
