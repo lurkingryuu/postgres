@@ -74,6 +74,7 @@ PG_FUNCTION_INFO_V1(pg_authorization_sync_entity);
  * --------------------------------------------------------------------------
  */
 static char *cedar_agent_url = NULL;     /* Base URL for Cedar Agent */
+static char *cedar_namespace = NULL;     /* Namespace for Cedar entities */
 static int cedar_request_timeout = 5000; /* Timeout in milliseconds */
 static bool cedar_authorization_enabled = true;
 static bool cedar_entity_sync_enabled = true;
@@ -223,35 +224,35 @@ static const char *get_client_ip(void) {
  */
 static const char *get_cedar_action_for_bit(AclMode bit) {
   if (bit == ACL_SELECT)
-    return "Select";
+    return "SELECT";
   if (bit == ACL_INSERT)
-    return "Insert";
+    return "INSERT";
   if (bit == ACL_UPDATE)
-    return "Update";
+    return "UPDATE";
   if (bit == ACL_DELETE)
-    return "Delete";
+    return "DELETE";
   if (bit == ACL_TRUNCATE)
-    return "Truncate";
+    return "TRUNCATE";
   if (bit == ACL_REFERENCES)
-    return "References";
+    return "REFERENCES";
   if (bit == ACL_TRIGGER)
-    return "Trigger";
+    return "TRIGGER";
   if (bit == ACL_EXECUTE)
-    return "Execute";
+    return "EXECUTE";
   if (bit == ACL_USAGE)
-    return "Usage";
+    return "USAGE";
   if (bit == ACL_CREATE)
-    return "Create";
+    return "CREATE";
   if (bit == ACL_CREATE_TEMP)
-    return "CreateTemp";
+    return "CREATE_TEMP";
   if (bit == ACL_CONNECT)
-    return "Connect";
+    return "CONNECT";
   if (bit == ACL_SET)
-    return "Set";
+    return "SET";
   if (bit == ACL_ALTER_SYSTEM)
-    return "AlterSystem";
+    return "ALTER_SYSTEM";
   if (bit == ACL_MAINTAIN)
-    return "Maintain";
+    return "MAINTAIN";
   return NULL;
 }
 
@@ -326,20 +327,21 @@ static AuthorizationResult cedar_call_is_authorized(const char *principal_type,
   {
     char *escaped_principal = json_escape_string(principal_id);
     char *escaped_resource = json_escape_string(resource_id);
+    const char *ns_prefix = (cedar_namespace && cedar_namespace[0] != '\0') ? psprintf("%s::", cedar_namespace) : "";
 
     appendStringInfoString(&request_body, "{");
 
-    /* Principal: User::"username" */
-    appendStringInfo(&request_body, "\"principal\":\"%s::\\\"%s\\\"\"",
-                     principal_type, escaped_principal);
+    /* Principal: PostgreSQL::User::"username" */
+    appendStringInfo(&request_body, "\"principal\":\"%s%s::\\\"%s\\\"\"",
+                     ns_prefix, principal_type, escaped_principal);
 
-    /* Action: Action::"Select" */
-    appendStringInfo(&request_body, ",\"action\":\"Action::\\\"%s\\\"\"",
-                     action);
+    /* Action: PostgreSQL::Action::"SELECT" */
+    appendStringInfo(&request_body, ",\"action\":\"%sAction::\\\"%s\\\"\"",
+                     ns_prefix, action);
 
-    /* Resource: Table::"schema.tablename" */
-    appendStringInfo(&request_body, ",\"resource\":\"%s::\\\"%s\\\"\"",
-                     resource_type, escaped_resource);
+    /* Resource: PostgreSQL::Table::"schema.tablename" */
+    appendStringInfo(&request_body, ",\"resource\":\"%s%s::\\\"%s\\\"\"",
+                     ns_prefix, resource_type, escaped_resource);
 
     /* Context with time and IP information */
     appendStringInfo(
@@ -487,10 +489,11 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
 
   /* Build JSON request body: array with single entity */
   json_escaped_id = json_escape_string(entity_id);
+  const char *ns_prefix = (cedar_namespace && cedar_namespace[0] != '\0') ? psprintf("%s::", cedar_namespace) : "";
 
   appendStringInfoString(&request_body, "[{");
-  appendStringInfo(&request_body, "\"uid\":{\"type\":\"%s\",\"id\":\"%s\"}",
-                   entity_type, json_escaped_id);
+  appendStringInfo(&request_body, "\"uid\":{\"type\":\"%s%s\",\"id\":\"%s\"}",
+                   ns_prefix, entity_type, json_escaped_id);
   /* Parents are empty to match MySQL implementation */
   appendStringInfoString(&request_body, ",\"attrs\":{},\"parents\":[]}]");
 
@@ -1184,6 +1187,12 @@ void _PG_init(void) {
                           "Timeout for Cedar Agent requests in milliseconds",
                           NULL, &cedar_request_timeout, 5000, 100, 60000,
                           PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL, NULL);
+
+  DefineCustomStringVariable(
+      "pg_authorization.namespace", "Namespace for Cedar authorization",
+      "When set, all entities and actions are prefixed with this namespace. "
+      "Example: PostgreSQL",
+      &cedar_namespace, "PostgreSQL", PGC_SIGHUP, 0, NULL, NULL, NULL);
 
   DefineCustomBoolVariable("pg_authorization.enabled",
                            "Enable or disable Cedar authorization checks", NULL,
