@@ -472,9 +472,13 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
   {
     char *ns_prefix = (cedar_namespace && cedar_namespace[0] != '\0') ? psprintf("%s::", cedar_namespace) : NULL;
     const char *ns_str = ns_prefix ? ns_prefix : "";
+    char *full_uid;
+
+    /* Build full namespaced UID: Namespace::Type::"id" */
+    full_uid = psprintf("%s%s::\"%s\"", ns_str, entity_type, entity_id);
 
     /*
-     * Build URL: <base>[/v1]/data/single/<urlencoded id>
+     * Build URL: <base>[/v1]/data/single/<urlencoded full_uid>
      *
      * This matches the MySQL ddl_audit plugin behavior where the base may
      * be either http://host:port or http://host:port/v1.
@@ -488,13 +492,13 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
               url.data[url.len - 2] == 'v' &&
               url.data[url.len - 1] == '1');
 
-    url_escaped_id = curl_easy_escape(curl, entity_id, (int)strlen(entity_id));
+    url_escaped_id = curl_easy_escape(curl, full_uid, (int)strlen(full_uid));
     if (has_v1)
       appendStringInfo(&url, "/data/single/%s",
-                       url_escaped_id ? url_escaped_id : entity_id);
+                       url_escaped_id ? url_escaped_id : full_uid);
     else
       appendStringInfo(&url, "/v1/data/single/%s",
-                       url_escaped_id ? url_escaped_id : entity_id);
+                       url_escaped_id ? url_escaped_id : full_uid);
 
     /* Build JSON request body: array with single entity */
     json_escaped_id = json_escape_string(entity_id);
@@ -506,6 +510,7 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
     appendStringInfoString(&request_body, ",\"attrs\":{},\"parents\":[]}]");
 
     pfree(json_escaped_id);
+    pfree(full_uid);
     if (ns_prefix)
       pfree(ns_prefix);
   }
@@ -613,28 +618,41 @@ static bool cedar_sync_entity_delete(const char *entity_type,
   initStringInfo(&response_body);
   initStringInfo(&url);
 
-  /*
-   * Build URL: <base>[/v1]/data/single/<urlencoded id>
-   *
-   * This matches the MySQL ddl_audit plugin behavior where the base may
-   * be either http://host:port or http://host:port/v1.
-   */
-  appendStringInfoString(&url, cedar_agent_url);
-  if (url.len > 0 && url.data[url.len - 1] == '/')
-    url.data[--url.len] = '\0';
+  {
+    char *ns_prefix = (cedar_namespace && cedar_namespace[0] != '\0') ? psprintf("%s::", cedar_namespace) : NULL;
+    const char *ns_str = ns_prefix ? ns_prefix : "";
+    char *full_uid;
 
-  has_v1 = (url.len >= 3 &&
-            url.data[url.len - 3] == '/' &&
-            url.data[url.len - 2] == 'v' &&
-            url.data[url.len - 1] == '1');
+    /* Build full namespaced UID: Namespace::Type::"id" */
+    full_uid = psprintf("%s%s::\"%s\"", ns_str, entity_type, entity_id);
 
-  url_escaped_id = curl_easy_escape(curl, entity_id, (int)strlen(entity_id));
-  if (has_v1)
-    appendStringInfo(&url, "/data/single/%s",
-                     url_escaped_id ? url_escaped_id : entity_id);
-  else
-    appendStringInfo(&url, "/v1/data/single/%s",
-                     url_escaped_id ? url_escaped_id : entity_id);
+    /*
+     * Build URL: <base>[/v1]/data/single/<urlencoded full_uid>
+     *
+     * This matches the MySQL ddl_audit plugin behavior where the base may
+     * be either http://host:port or http://host:port/v1.
+     */
+    appendStringInfoString(&url, cedar_agent_url);
+    if (url.len > 0 && url.data[url.len - 1] == '/')
+      url.data[--url.len] = '\0';
+
+    has_v1 = (url.len >= 3 &&
+              url.data[url.len - 3] == '/' &&
+              url.data[url.len - 2] == 'v' &&
+              url.data[url.len - 1] == '1');
+
+    url_escaped_id = curl_easy_escape(curl, full_uid, (int)strlen(full_uid));
+    if (has_v1)
+      appendStringInfo(&url, "/data/single/%s",
+                       url_escaped_id ? url_escaped_id : full_uid);
+    else
+      appendStringInfo(&url, "/v1/data/single/%s",
+                       url_escaped_id ? url_escaped_id : full_uid);
+
+    if (ns_prefix)
+      pfree(ns_prefix);
+    pfree(full_uid);
+  }
 
   /* Setup curl request */
   curl_easy_setopt(curl, CURLOPT_URL, url.data);
