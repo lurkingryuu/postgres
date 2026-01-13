@@ -72,18 +72,10 @@ INSERT INTO user_permissions (user_id, permission, resource_type, resource_id) V
     (3, 'read', 'project', 3)
 ON CONFLICT DO NOTHING;
 
--- Create Cedar authorization extension (for modified PostgreSQL)
+-- Create pg_authorization extension (for modified PostgreSQL)
 -- This will only work on the modified PostgreSQL with hooks
 DO $$
 BEGIN
-    -- Try to create extensions, ignore if they don't exist
-    BEGIN
-        CREATE EXTENSION IF NOT EXISTS cedar_auth;
-    EXCEPTION
-        WHEN OTHERS THEN
-            RAISE NOTICE 'Note: cedar_auth extension not available or failed: %', SQLERRM;
-    END;
-
     BEGIN
         CREATE EXTENSION IF NOT EXISTS pg_authorization;
     EXCEPTION

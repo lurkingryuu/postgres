@@ -49,6 +49,29 @@ COMMENT ON FUNCTION pg_authorization_sync_entity(text, text) IS
 'Manually sync an entity to the Cedar Agent. Returns true on success.
 Example: SELECT pg_authorization_sync_entity(''Table'', ''public.mytable'');';
 
+-- Function to get cache statistics
+CREATE FUNCTION pg_authorization_cache_stats(
+    OUT hits bigint,
+    OUT misses bigint,
+    OUT evictions bigint,
+    OUT entries bigint
+)
+RETURNS record
+AS 'MODULE_PATHNAME', 'pg_authorization_cache_stats'
+LANGUAGE C STRICT VOLATILE;
+
+COMMENT ON FUNCTION pg_authorization_cache_stats() IS
+'Returns authorization cache statistics';
+
+-- Function to reset cache
+CREATE FUNCTION pg_authorization_cache_reset()
+RETURNS void
+AS 'MODULE_PATHNAME', 'pg_authorization_cache_reset'
+LANGUAGE C STRICT VOLATILE;
+
+COMMENT ON FUNCTION pg_authorization_cache_reset() IS
+'Resets the authorization cache';
+
 -- View for easy access to statistics
 CREATE VIEW pg_authorization_statistics AS
 SELECT * FROM pg_authorization_stats();

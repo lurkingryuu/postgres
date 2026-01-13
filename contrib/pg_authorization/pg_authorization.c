@@ -15,6 +15,8 @@
  * - Entity synchronization: syncs Users, Tables, Databases to Cedar Agent
  * - Cedar-compatible request format (principal/action/resource)
  * - Configurable via GUC variables
+ * - Authorization caching to reduce network overhead
+ * - Persistent CURL connections for improved latency
  *
  * Cedar Agent API Integration:
  * - Authorization: POST /v1/is_authorized
@@ -44,6 +46,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "executor/executor.h"
 #include "fmgr.h"
@@ -60,6 +63,8 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/hsearch.h"
+#include "utils/timestamp.h"
 
 PG_MODULE_MAGIC;
 
@@ -68,6 +73,8 @@ PG_FUNCTION_INFO_V1(pg_authorization_is_enabled);
 PG_FUNCTION_INFO_V1(pg_authorization_stats);
 PG_FUNCTION_INFO_V1(pg_authorization_reset_stats);
 PG_FUNCTION_INFO_V1(pg_authorization_sync_entity);
+PG_FUNCTION_INFO_V1(pg_authorization_cache_stats);
+PG_FUNCTION_INFO_V1(pg_authorization_cache_reset);
 
 /* --------------------------------------------------------------------------
  * GUC variables
@@ -79,6 +86,11 @@ static int cedar_request_timeout = 5000; /* Timeout in milliseconds */
 static bool cedar_authorization_enabled = true;
 static bool cedar_entity_sync_enabled = true;
 static bool cedar_log_decisions = false;
+
+/* Caching GUCs */
+static bool cedar_cache_enabled = true;
+static int cedar_cache_size = 1024;
+static int cedar_cache_ttl = 300; /* seconds */
 
 /* --------------------------------------------------------------------------
  * Statistics counters
@@ -93,12 +105,37 @@ static volatile long stats_sync_requests = 0;
 static volatile long stats_sync_successes = 0;
 static volatile long stats_sync_failures = 0;
 
+/* Cache statistics */
+static volatile long stats_cache_hits = 0;
+static volatile long stats_cache_misses = 0;
+static volatile long stats_cache_evictions = 0;
+
+/* --------------------------------------------------------------------------
+ * Internal state
+ * --------------------------------------------------------------------------
+ */
+static CURL *persistent_curl = NULL;
+static HTAB *auth_cache = NULL;
+
+/* Cache structures */
+typedef struct AuthCacheKey {
+  char rolename[NAMEDATALEN];
+  char action[64];
+  char resource_type[64];
+  char resource_id[256]; /* Sufficient for schema.table.column */
+} AuthCacheKey;
+
+typedef struct AuthCacheEntry {
+  AuthCacheKey key;
+  AuthorizationResult result;
+  TimestampTz expires;
+} AuthCacheEntry;
+
 /* --------------------------------------------------------------------------
  * Saved hook entries (for chaining)
  * --------------------------------------------------------------------------
  */
 static object_access_hook_type prev_object_access_hook = NULL;
-static ExecutorCheckPerms_hook_type prev_executor_check_perms_hook = NULL;
 static ProcessUtility_hook_type prev_process_utility_hook = NULL;
 static universal_authorization_hook_type prev_universal_auth_hook = NULL;
 
@@ -107,12 +144,10 @@ static universal_authorization_hook_type prev_universal_auth_hook = NULL;
  * --------------------------------------------------------------------------
  */
 void _PG_init(void);
+void _PG_fini(void);
 
 static void cedar_object_access_hook(ObjectAccessType access, Oid classId,
                                      Oid objectId, int subId, void *arg);
-
-static bool cedar_executor_check_perms(List *rangeTable, List *rteperminfos,
-                                       bool ereport_on_violation);
 
 static void
 cedar_process_utility_hook(PlannedStmt *pstmt, const char *queryString,
@@ -122,6 +157,14 @@ cedar_process_utility_hook(PlannedStmt *pstmt, const char *queryString,
 
 static AuthorizationResult
 cedar_authorization_hook(AuthorizationInfo *auth_info);
+
+static void init_auth_cache(void);
+static void reset_auth_cache(void);
+static AuthorizationResult check_auth_cache(const char *rolename, const char *action,
+                                           const char *res_type, const char *res_id);
+static void update_auth_cache(const char *rolename, const char *action,
+                             const char *res_type, const char *res_id,
+                             AuthorizationResult result);
 
 /* --------------------------------------------------------------------------
  * Helper: JSON string escaping
@@ -213,9 +256,13 @@ static int get_current_time_int(void) {
  * --------------------------------------------------------------------------
  */
 static const char *get_client_ip(void) {
-  if (MyProcPort && MyProcPort->remote_host)
+  if (MyProcPort && MyProcPort->remote_host) {
+    if (strcmp(MyProcPort->remote_host, "[local]") == 0 || 
+        strcmp(MyProcPort->remote_host, "unknown") == 0)
+      return "127.0.0.1";
     return MyProcPort->remote_host;
-  return "unknown";
+  }
+  return "127.0.0.1";
 }
 
 /* --------------------------------------------------------------------------
@@ -274,12 +321,11 @@ pg_auth_curl_write_cb(void *contents, size_t size, size_t nmemb, void *userp)
  * Cedar Agent: Call /v1/is_authorized endpoint
  * --------------------------------------------------------------------------
  */
-static AuthorizationResult cedar_call_is_authorized(const char *principal_type,
-                                                    const char *principal_id,
-                                                    const char *action,
-                                                    const char *resource_type,
-                                                    const char *resource_id) {
-  CURL *curl;
+static AuthorizationResult cedar_call_is_authorized_internal(const char *principal_type,
+                                                            const char *principal_id,
+                                                            const char *action,
+                                                            const char *resource_type,
+                                                            const char *resource_id) {
   CURLcode res;
   StringInfoData request_body;
   StringInfoData response_body;
@@ -288,29 +334,24 @@ static AuthorizationResult cedar_call_is_authorized(const char *principal_type,
   long response_code;
   AuthorizationResult result = PG_AUTH_RESULT_IGNORE;
 
-  /* Check if URL is configured */
-  if (cedar_agent_url == NULL || cedar_agent_url[0] == '\0')
-    return PG_AUTH_RESULT_IGNORE;
-
-  stats_auth_requests++;
-
-  curl = curl_easy_init();
-  if (!curl) {
-    ereport(WARNING, (errmsg("pg_authorization: failed to initialize curl")));
-    stats_auth_errors++;
-    return PG_AUTH_RESULT_IGNORE;
+  /* Use persistent handle if possible */
+  if (persistent_curl == NULL) {
+    persistent_curl = curl_easy_init();
+    if (!persistent_curl) {
+      ereport(WARNING, (errmsg("pg_authorization: failed to initialize curl")));
+      stats_auth_errors++;
+      return PG_AUTH_RESULT_IGNORE;
+    }
+  } else {
+    /* Reset handle for new request but keep connections open */
+    curl_easy_reset(persistent_curl);
   }
 
   initStringInfo(&request_body);
   initStringInfo(&response_body);
   initStringInfo(&url);
 
-  /*
-   * Build URL: <base>[/v1]/is_authorized
-   *
-   * This matches the MySQL cedar_authorization + ddl_audit behavior where
-   * the base may be either http://host:port or http://host:port/v1.
-   */
+  /* Build URL */
   appendStringInfoString(&url, cedar_agent_url);
   if (url.len > 0 && url.data[url.len - 1] == '/')
     url.data[--url.len] = '\0';
@@ -323,7 +364,7 @@ static AuthorizationResult cedar_call_is_authorized(const char *principal_type,
   else
     appendStringInfoString(&url, "/v1/is_authorized");
 
-  /* Build JSON request body in Cedar format */
+  /* Build JSON request body */
   {
     char *escaped_principal = json_escape_string(principal_id);
     char *escaped_resource = json_escape_string(resource_id);
@@ -331,53 +372,39 @@ static AuthorizationResult cedar_call_is_authorized(const char *principal_type,
     const char *ns_str = ns_prefix ? ns_prefix : "";
 
     appendStringInfoString(&request_body, "{");
-
-    /* Principal: PostgreSQL::User::"username" */
     appendStringInfo(&request_body, "\"principal\":\"%s%s::\\\"%s\\\"\"",
                      ns_str, principal_type, escaped_principal);
-
-    /* Action: PostgreSQL::Action::"SELECT" */
     appendStringInfo(&request_body, ",\"action\":\"%sAction::\\\"%s\\\"\"",
                      ns_str, action);
-
-    /* Resource: PostgreSQL::Table::"schema.tablename" */
     appendStringInfo(&request_body, ",\"resource\":\"%s%s::\\\"%s\\\"\"",
                      ns_str, resource_type, escaped_resource);
-
-    /* Context with time and IP information */
     appendStringInfo(
         &request_body,
         ",\"context\":{\"day\":\"%s\",\"date\":%d,\"time\":%d,\"ip\":{\"__extn\":{\"fn\":\"ip\",\"arg\":\"%s\"}}}",
         get_current_day(), get_current_date_int(), get_current_time_int(),
         get_client_ip());
-
     appendStringInfoString(&request_body, "}");
 
     pfree(escaped_principal);
     pfree(escaped_resource);
-    if (ns_prefix)
-      pfree(ns_prefix);
+    if (ns_prefix) pfree(ns_prefix);
   }
 
   /* Setup curl request */
-  curl_easy_setopt(curl, CURLOPT_URL, url.data);
-  curl_easy_setopt(curl, CURLOPT_POST, 1L);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body.data);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, pg_auth_curl_write_cb);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, cedar_request_timeout);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1000);
+  curl_easy_setopt(persistent_curl, CURLOPT_URL, url.data);
+  curl_easy_setopt(persistent_curl, CURLOPT_POST, 1L);
+  curl_easy_setopt(persistent_curl, CURLOPT_POSTFIELDS, request_body.data);
+  curl_easy_setopt(persistent_curl, CURLOPT_WRITEFUNCTION, pg_auth_curl_write_cb);
+  curl_easy_setopt(persistent_curl, CURLOPT_WRITEDATA, &response_body);
+  curl_easy_setopt(persistent_curl, CURLOPT_TIMEOUT_MS, cedar_request_timeout);
+  curl_easy_setopt(persistent_curl, CURLOPT_CONNECTTIMEOUT_MS, 1000);
+  curl_easy_setopt(persistent_curl, CURLOPT_TCP_KEEPALIVE, 1L);
 
   headers = curl_slist_append(headers, "Content-Type: application/json");
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-  if (cedar_log_decisions) {
-    ereport(DEBUG1, (errmsg("pg_authorization: sending request to %s", url.data),
-                  errdetail("Request body: %s", request_body.data)));
-  }
+  curl_easy_setopt(persistent_curl, CURLOPT_HTTPHEADER, headers);
 
   /* Perform the request */
-  res = curl_easy_perform(curl);
+  res = curl_easy_perform(persistent_curl);
 
   if (res != CURLE_OK) {
     ereport(LOG, (errmsg("pg_authorization: curl request failed: %s",
@@ -385,21 +412,10 @@ static AuthorizationResult cedar_call_is_authorized(const char *principal_type,
     stats_auth_errors++;
     result = PG_AUTH_RESULT_IGNORE;
   } else {
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-
-    /* Ensure response body is null-terminated for logging */
+    curl_easy_getinfo(persistent_curl, CURLINFO_RESPONSE_CODE, &response_code);
     appendStringInfoChar(&response_body, '\0');
 
-    if (cedar_log_decisions) {
-      ereport(DEBUG1,
-              (errmsg("pg_authorization: response code %ld", response_code)));
-    }
-
     if (response_code == 200) {
-      /*
-       * Parse Cedar Agent response. Expected format:
-       * {"decision":"Allow"} or {"decision":"Deny"}
-       */
       if (strstr(response_body.data, "\"Allow\"") != NULL) {
         result = PG_AUTH_RESULT_GRANT;
         stats_auth_grants++;
@@ -407,25 +423,48 @@ static AuthorizationResult cedar_call_is_authorized(const char *principal_type,
         result = PG_AUTH_RESULT_DENY;
         stats_auth_denies++;
       } else {
-        /* Unknown response - treat as IGNORE */
         result = PG_AUTH_RESULT_IGNORE;
         stats_auth_ignores++;
       }
     } else {
-      ereport(WARNING,
-              (errmsg("pg_authorization: Cedar Agent returned status %ld",
-                      response_code)));
+      ereport(WARNING, (errmsg("pg_authorization: Cedar Agent returned status %ld", response_code)));
       stats_auth_errors++;
       result = PG_AUTH_RESULT_IGNORE;
     }
   }
 
-  /* Cleanup */
   curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
   pfree(request_body.data);
   pfree(response_body.data);
   pfree(url.data);
+
+  return result;
+}
+
+static AuthorizationResult cedar_call_is_authorized(const char *principal_type,
+                                                    const char *principal_id,
+                                                    const char *action,
+                                                    const char *resource_type,
+                                                    const char *resource_id) {
+  AuthorizationResult result;
+
+  /* Check if URL is configured */
+  if (cedar_agent_url == NULL || cedar_agent_url[0] == '\0')
+    return PG_AUTH_RESULT_IGNORE;
+
+  /* Check cache first */
+  result = check_auth_cache(principal_id, action, resource_type, resource_id);
+  if (result != PG_AUTH_RESULT_IGNORE)
+    return result;
+
+  stats_auth_requests++;
+
+  /* Cache miss - call agent */
+  result = cedar_call_is_authorized_internal(principal_type, principal_id, action, resource_type, resource_id);
+
+  /* Update cache */
+  if (result != PG_AUTH_RESULT_IGNORE)
+    update_auth_cache(principal_id, action, resource_type, resource_id, result);
 
   return result;
 }
@@ -436,7 +475,6 @@ static AuthorizationResult cedar_call_is_authorized(const char *principal_type,
  */
 static bool cedar_sync_entity_upsert(const char *entity_type,
                                      const char *entity_id) {
-  CURL *curl;
   CURLcode res;
   StringInfoData request_body;
   StringInfoData response_body;
@@ -455,14 +493,11 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
 
   stats_sync_requests++;
 
-  curl = curl_easy_init();
-  if (!curl) {
-    ereport(
-        WARNING,
-        (errmsg(
-            "pg_authorization: failed to initialize curl for entity sync")));
-    stats_sync_failures++;
-    return false;
+  if (persistent_curl == NULL) {
+    persistent_curl = curl_easy_init();
+    if (!persistent_curl) return false;
+  } else {
+    curl_easy_reset(persistent_curl);
   }
 
   initStringInfo(&request_body);
@@ -474,15 +509,8 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
     const char *ns_str = ns_prefix ? ns_prefix : "";
     char *full_uid;
 
-    /* Build full namespaced UID: Namespace::Type::"id" */
     full_uid = psprintf("%s%s::\"%s\"", ns_str, entity_type, entity_id);
 
-    /*
-     * Build URL: <base>[/v1]/data/single/<urlencoded full_uid>
-     *
-     * This matches the MySQL ddl_audit plugin behavior where the base may
-     * be either http://host:port or http://host:port/v1.
-     */
     appendStringInfoString(&url, cedar_agent_url);
     if (url.len > 0 && url.data[url.len - 1] == '/')
       url.data[--url.len] = '\0';
@@ -492,89 +520,54 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
               url.data[url.len - 2] == 'v' &&
               url.data[url.len - 1] == '1');
 
-    url_escaped_id = curl_easy_escape(curl, full_uid, (int)strlen(full_uid));
+    url_escaped_id = curl_easy_escape(persistent_curl, full_uid, (int)strlen(full_uid));
     if (has_v1)
-      appendStringInfo(&url, "/data/single/%s",
-                       url_escaped_id ? url_escaped_id : full_uid);
+      appendStringInfo(&url, "/data/single/%s", url_escaped_id ? url_escaped_id : full_uid);
     else
-      appendStringInfo(&url, "/v1/data/single/%s",
-                       url_escaped_id ? url_escaped_id : full_uid);
+      appendStringInfo(&url, "/v1/data/single/%s", url_escaped_id ? url_escaped_id : full_uid);
 
-    /* Build JSON request body: array with single entity */
     json_escaped_id = json_escape_string(entity_id);
-
     appendStringInfoString(&request_body, "[{");
     appendStringInfo(&request_body, "\"uid\":{\"type\":\"%s%s\",\"id\":\"%s\"}",
                      ns_str, entity_type, json_escaped_id);
-    /* Parents are empty to match MySQL implementation */
     appendStringInfoString(&request_body, ",\"attrs\":{},\"parents\":[]}]");
 
     pfree(json_escaped_id);
     pfree(full_uid);
-    if (ns_prefix)
-      pfree(ns_prefix);
+    if (ns_prefix) pfree(ns_prefix);
   }
 
-  /* Setup curl request */
-  curl_easy_setopt(curl, CURLOPT_URL, url.data);
-  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body.data);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, pg_auth_curl_write_cb);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, cedar_request_timeout);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1000);
+  curl_easy_setopt(persistent_curl, CURLOPT_URL, url.data);
+  curl_easy_setopt(persistent_curl, CURLOPT_CUSTOMREQUEST, "PUT");
+  curl_easy_setopt(persistent_curl, CURLOPT_POSTFIELDS, request_body.data);
+  curl_easy_setopt(persistent_curl, CURLOPT_WRITEFUNCTION, pg_auth_curl_write_cb);
+  curl_easy_setopt(persistent_curl, CURLOPT_WRITEDATA, &response_body);
+  curl_easy_setopt(persistent_curl, CURLOPT_TIMEOUT_MS, cedar_request_timeout);
+  curl_easy_setopt(persistent_curl, CURLOPT_CONNECTTIMEOUT_MS, 1000);
 
   headers = curl_slist_append(headers, "Content-Type: application/json");
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(persistent_curl, CURLOPT_HTTPHEADER, headers);
 
-  if (cedar_log_decisions) {
-    ereport(DEBUG1, (errmsg("pg_authorization: syncing entity %s:\"%s\" to %s",
-                         entity_type, entity_id, url.data),
-                  errdetail("Request body: %s", request_body.data)));
-  }
-
-  /* Perform the request */
-  res = curl_easy_perform(curl);
+  res = curl_easy_perform(persistent_curl);
 
   if (res != CURLE_OK) {
-    ereport(WARNING, (errmsg("pg_authorization: entity sync failed: %s",
-                             curl_easy_strerror(res))));
+    ereport(WARNING, (errmsg("pg_authorization: entity sync failed: %s", curl_easy_strerror(res))));
     stats_sync_failures++;
   } else {
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-
+    curl_easy_getinfo(persistent_curl, CURLINFO_RESPONSE_CODE, &response_code);
     if (response_code >= 200 && response_code < 300) {
-      if (cedar_log_decisions)
-        ereport(DEBUG1,
-                (errmsg("pg_authorization: entity sync succeeded for %s:\"%s\"",
-                        entity_type, entity_id)));
       stats_sync_successes++;
       success = true;
     } else if (response_code == 409) {
-      /*
-       * Conflict - entity already exists. Treat this as success for
-       * idempotency, matching the MySQL ddl_audit plugin.
-       */
-      if (cedar_log_decisions)
-        ereport(LOG,
-                (errmsg("pg_authorization: entity %s:\"%s\" already exists "
-                        "(HTTP 409), treating as success",
-                        entity_type, entity_id)));
       stats_sync_successes++;
       success = true;
     } else {
-      ereport(WARNING,
-              (errmsg("pg_authorization: entity sync returned HTTP %ld",
-                      response_code)));
       stats_sync_failures++;
     }
   }
 
-  /* Cleanup */
-  if (url_escaped_id)
-    curl_free(url_escaped_id);
+  if (url_escaped_id) curl_free(url_escaped_id);
   curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
   pfree(request_body.data);
   pfree(response_body.data);
   pfree(url.data);
@@ -588,7 +581,6 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
  */
 static bool cedar_sync_entity_delete(const char *entity_type,
                                      const char *entity_id) {
-  CURL *curl;
   CURLcode res;
   StringInfoData response_body;
   StringInfoData url;
@@ -598,21 +590,17 @@ static bool cedar_sync_entity_delete(const char *entity_type,
   bool success = false;
   bool has_v1;
 
-  /* Check if sync is enabled and URL is configured */
   if (!cedar_entity_sync_enabled || cedar_agent_url == NULL ||
       cedar_agent_url[0] == '\0')
     return false;
 
   stats_sync_requests++;
 
-  curl = curl_easy_init();
-  if (!curl) {
-    ereport(
-        WARNING,
-        (errmsg(
-            "pg_authorization: failed to initialize curl for entity delete")));
-    stats_sync_failures++;
-    return false;
+  if (persistent_curl == NULL) {
+    persistent_curl = curl_easy_init();
+    if (!persistent_curl) return false;
+  } else {
+    curl_easy_reset(persistent_curl);
   }
 
   initStringInfo(&response_body);
@@ -623,15 +611,8 @@ static bool cedar_sync_entity_delete(const char *entity_type,
     const char *ns_str = ns_prefix ? ns_prefix : "";
     char *full_uid;
 
-    /* Build full namespaced UID: Namespace::Type::"id" */
     full_uid = psprintf("%s%s::\"%s\"", ns_str, entity_type, entity_id);
 
-    /*
-     * Build URL: <base>[/v1]/data/single/<urlencoded full_uid>
-     *
-     * This matches the MySQL ddl_audit plugin behavior where the base may
-     * be either http://host:port or http://host:port/v1.
-     */
     appendStringInfoString(&url, cedar_agent_url);
     if (url.len > 0 && url.data[url.len - 1] == '/')
       url.data[--url.len] = '\0';
@@ -641,80 +622,46 @@ static bool cedar_sync_entity_delete(const char *entity_type,
               url.data[url.len - 2] == 'v' &&
               url.data[url.len - 1] == '1');
 
-    url_escaped_id = curl_easy_escape(curl, full_uid, (int)strlen(full_uid));
+    url_escaped_id = curl_easy_escape(persistent_curl, full_uid, (int)strlen(full_uid));
     if (has_v1)
-      appendStringInfo(&url, "/data/single/%s",
-                       url_escaped_id ? url_escaped_id : full_uid);
+      appendStringInfo(&url, "/data/single/%s", url_escaped_id ? url_escaped_id : full_uid);
     else
-      appendStringInfo(&url, "/v1/data/single/%s",
-                       url_escaped_id ? url_escaped_id : full_uid);
+      appendStringInfo(&url, "/v1/data/single/%s", url_escaped_id ? url_escaped_id : full_uid);
 
-    if (ns_prefix)
-      pfree(ns_prefix);
+    if (ns_prefix) pfree(ns_prefix);
     pfree(full_uid);
   }
 
-  /* Setup curl request */
-  curl_easy_setopt(curl, CURLOPT_URL, url.data);
-  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, pg_auth_curl_write_cb);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, cedar_request_timeout);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1000);
+  curl_easy_setopt(persistent_curl, CURLOPT_URL, url.data);
+  curl_easy_setopt(persistent_curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+  curl_easy_setopt(persistent_curl, CURLOPT_WRITEFUNCTION, pg_auth_curl_write_cb);
+  curl_easy_setopt(persistent_curl, CURLOPT_WRITEDATA, &response_body);
+  curl_easy_setopt(persistent_curl, CURLOPT_TIMEOUT_MS, cedar_request_timeout);
+  curl_easy_setopt(persistent_curl, CURLOPT_CONNECTTIMEOUT_MS, 1000);
 
   headers = curl_slist_append(headers, "Content-Type: application/json");
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(persistent_curl, CURLOPT_HTTPHEADER, headers);
 
-  if (cedar_log_decisions) {
-    ereport(DEBUG1, (errmsg("pg_authorization: deleting entity %s:\"%s\" from %s",
-                         entity_type, entity_id, url.data)));
-  }
-
-  /* Perform the request */
-  res = curl_easy_perform(curl);
+  res = curl_easy_perform(persistent_curl);
 
   if (res != CURLE_OK) {
-    ereport(WARNING, (errmsg("pg_authorization: entity delete failed: %s",
-                             curl_easy_strerror(res))));
+    ereport(WARNING, (errmsg("pg_authorization: entity delete failed: %s", curl_easy_strerror(res))));
     stats_sync_failures++;
   } else {
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-
+    curl_easy_getinfo(persistent_curl, CURLINFO_RESPONSE_CODE, &response_code);
     if (response_code >= 200 && response_code < 300) {
-      if (cedar_log_decisions)
-        ereport(DEBUG1,
-                (errmsg("pg_authorization: entity delete succeeded for %s:\"%s\"",
-                        entity_type, entity_id)));
       stats_sync_successes++;
       success = true;
     } else if (response_code == 404) {
-      /*
-       * Not Found - entity does not exist. Treat this as success for
-       * idempotency, matching the upsert behavior that treats HTTP 409 as
-       * success. This commonly occurs during teardown (DROP ... IF EXISTS)
-       * when the Cedar Agent has no prior state for the entity.
-       */
-      if (cedar_log_decisions)
-        ereport(LOG,
-                (errmsg("pg_authorization: entity %s:\"%s\" not found "
-                        "(HTTP 404), treating as success",
-                        entity_type, entity_id)));
       stats_sync_successes++;
       success = true;
     } else {
-      ereport(WARNING,
-              (errmsg("pg_authorization: entity delete returned HTTP %ld",
-                      response_code),
-               errdetail("Response: %s", response_body.data)));
       stats_sync_failures++;
     }
   }
 
-  /* Cleanup */
-  if (url_escaped_id)
-    curl_free(url_escaped_id);
+  if (url_escaped_id) curl_free(url_escaped_id);
   curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
   pfree(response_body.data);
   pfree(url.data);
 
@@ -723,8 +670,6 @@ static bool cedar_sync_entity_delete(const char *entity_type,
 
 /* --------------------------------------------------------------------------
  * Universal authorization hook callback
- *
- * This is called for ACL checks from the core authorization system.
  * --------------------------------------------------------------------------
  */
 static AuthorizationResult
@@ -735,34 +680,28 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
   AclMode required_perms = 0;
   bool check_perms_loop = false;
 
-  /* Chain to previous hook if any */
   if (prev_universal_auth_hook) {
     result = prev_universal_auth_hook(auth_info);
     if (result != PG_AUTH_RESULT_IGNORE)
       return result;
   }
 
-  /* Check if plugin is enabled */
   if (!cedar_authorization_enabled)
     return PG_AUTH_RESULT_IGNORE;
 
-  /* Check if URL is configured */
   if (cedar_agent_url == NULL || cedar_agent_url[0] == '\0')
     return PG_AUTH_RESULT_IGNORE;
 
   initStringInfo(&resource_id);
 
-  /* Build Cedar request based on event type */
   switch (auth_info->event_type) {
   case PG_AUTH_EVENT_DML:
-    /* Legacy path if passed explicitly */
     required_perms = auth_info->info.dml.required_perms;
     check_perms_loop = true;
     resource_type = "Table";
 
     if (auth_info->info.dml.schemaname && auth_info->info.dml.relname)
-      appendStringInfo(&resource_id, "%s.%s", auth_info->info.dml.schemaname,
-                       auth_info->info.dml.relname);
+      appendStringInfo(&resource_id, "%s.%s", auth_info->info.dml.schemaname, auth_info->info.dml.relname);
     else if (auth_info->info.dml.relname)
       appendStringInfoString(&resource_id, auth_info->info.dml.relname);
     else
@@ -771,10 +710,8 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
 
   case PG_AUTH_EVENT_DDL:
   case PG_AUTH_EVENT_UTILITY:
-    /* Only handle if command_tag is set */
     if (auth_info->info.ddl.command_tag) {
-        check_perms_loop = false; /* Single action */
-        /* Determine resource type based on class ID */
+        check_perms_loop = false;
         if (auth_info->info.ddl.classid == RelationRelationId)
           resource_type = "Table";
         else if (auth_info->info.ddl.classid == NamespaceRelationId)
@@ -784,19 +721,17 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
         else if (auth_info->info.ddl.classid == AuthIdRelationId)
           resource_type = "User";
         else if (auth_info->info.ddl.classid == ProcedureRelationId)
-          resource_type = "Routine"; /* Using Routine to match MySQL */
+          resource_type = "Routine";
         else
           resource_type = "Object";
 
         if (auth_info->info.ddl.schemaname && auth_info->info.ddl.objectname)
-          appendStringInfo(&resource_id, "%s.%s", auth_info->info.ddl.schemaname,
-                           auth_info->info.ddl.objectname);
+          appendStringInfo(&resource_id, "%s.%s", auth_info->info.ddl.schemaname, auth_info->info.ddl.objectname);
         else if (auth_info->info.ddl.objectname)
           appendStringInfoString(&resource_id, auth_info->info.ddl.objectname);
         else
           appendStringInfo(&resource_id, "oid_%u", auth_info->info.ddl.objectid);
           
-        /* Perform single check */
         result = cedar_call_is_authorized(
             "User", auth_info->rolename ? auth_info->rolename : "unknown", 
             auth_info->info.ddl.command_tag,
@@ -812,35 +747,24 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
     break;
 
   case PG_AUTH_EVENT_ACL_CHECK:
-    /* 
-     * This event is triggered by the native authorization system (aclchk.c)
-     * when a native check fails.
-     */
     {
-        char   *rel_name;
-        char   *schema_name;
-        char   *nsp_name;
-        char   *db_name;
-        char   *proc_name;
-
         required_perms = auth_info->info.ddl.required_perms;
         check_perms_loop = true;
 
-        /* Determine resource type and fetch names if possible */
         if (auth_info->info.ddl.classid == RelationRelationId)
         {
             if (auth_info->info.ddl.subid != 0)
             {
                 resource_type = "Column";
-                rel_name = get_rel_name(auth_info->info.ddl.objectid);
+                char *rel_name = get_rel_name(auth_info->info.ddl.objectid);
                 if (rel_name)
                 {
-                    Oid namespace_oid = get_rel_namespace(auth_info->info.ddl.objectid);
-                    schema_name = get_namespace_name(namespace_oid);
+                    Oid ns_oid = get_rel_namespace(auth_info->info.ddl.objectid);
+                    char *sch_name = get_namespace_name(ns_oid);
                     char *col_name = get_attname(auth_info->info.ddl.objectid, auth_info->info.ddl.subid, false);
 
-                    if (schema_name && col_name)
-                        appendStringInfo(&resource_id, "%s.%s.%s", schema_name, rel_name, col_name);
+                    if (sch_name && col_name)
+                        appendStringInfo(&resource_id, "%s.%s.%s", sch_name, rel_name, col_name);
                     else if (rel_name && col_name)
                         appendStringInfo(&resource_id, "%s.%s", rel_name, col_name);
                     else
@@ -848,107 +772,74 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
 
                     if (col_name) pfree(col_name);
                     if (rel_name) pfree(rel_name);
-                    if (schema_name) pfree(schema_name);
+                    if (sch_name) pfree(sch_name);
                 }
                 else
-                {
-                    appendStringInfo(&resource_id, "oid_%u.att_%d",
-                                     auth_info->info.ddl.objectid, auth_info->info.ddl.subid);
-                }
+                    appendStringInfo(&resource_id, "oid_%u.att_%d", auth_info->info.ddl.objectid, auth_info->info.ddl.subid);
             }
             else
             {
                 resource_type = "Table";
-                /* Try to fetch name */
-                rel_name = get_rel_name(auth_info->info.ddl.objectid);
+                char *rel_name = get_rel_name(auth_info->info.ddl.objectid);
                 if (rel_name)
                 {
-                    Oid namespace_oid = get_rel_namespace(auth_info->info.ddl.objectid);
-                    schema_name = get_namespace_name(namespace_oid);
-
-                    if (schema_name)
-                        appendStringInfo(&resource_id, "%s.%s", schema_name, rel_name);
+                    Oid ns_oid = get_rel_namespace(auth_info->info.ddl.objectid);
+                    char *sch_name = get_namespace_name(ns_oid);
+                    if (sch_name)
+                        appendStringInfo(&resource_id, "%s.%s", sch_name, rel_name);
                     else
                         appendStringInfoString(&resource_id, rel_name);
-
                     pfree(rel_name);
-                    if (schema_name)
-                        pfree(schema_name);
+                    if (sch_name) pfree(sch_name);
                 }
                 else
-                {
-                    appendStringInfo(&resource_id, "oid_%u",
-                                     auth_info->info.ddl.objectid);
-                }
+                    appendStringInfo(&resource_id, "oid_%u", auth_info->info.ddl.objectid);
             }
         }
         else if (auth_info->info.ddl.classid == NamespaceRelationId)
         {
             resource_type = "Schema";
-            nsp_name = get_namespace_name(auth_info->info.ddl.objectid);
-            if (nsp_name)
-            {
+            char *nsp_name = get_namespace_name(auth_info->info.ddl.objectid);
+            if (nsp_name) {
                 appendStringInfoString(&resource_id, nsp_name);
                 pfree(nsp_name);
-            }
-            else
-            {
-                appendStringInfo(&resource_id, "oid_%u",
-                                 auth_info->info.ddl.objectid);
-            }
+            } else
+                appendStringInfo(&resource_id, "oid_%u", auth_info->info.ddl.objectid);
         }
         else if (auth_info->info.ddl.classid == TypeRelationId)
         {
             resource_type = "Type";
             char *type_name = format_type_be(auth_info->info.ddl.objectid);
-            if (type_name)
-            {
+            if (type_name) {
                 appendStringInfoString(&resource_id, type_name);
                 pfree(type_name);
-            }
-            else
-            {
-                appendStringInfo(&resource_id, "oid_%u",
-                                 auth_info->info.ddl.objectid);
-            }
+            } else
+                appendStringInfo(&resource_id, "oid_%u", auth_info->info.ddl.objectid);
         }
         else if (auth_info->info.ddl.classid == DatabaseRelationId)
         {
             resource_type = "Database";
-            db_name = get_database_name(auth_info->info.ddl.objectid);
-            if (db_name)
-            {
+            char *db_name = get_database_name(auth_info->info.ddl.objectid);
+            if (db_name) {
                 appendStringInfoString(&resource_id, db_name);
                 pfree(db_name);
-            }
-            else
-            {
-                appendStringInfo(&resource_id, "oid_%u",
-                                 auth_info->info.ddl.objectid);
-            }
+            } else
+                appendStringInfo(&resource_id, "oid_%u", auth_info->info.ddl.objectid);
         }
         else if (auth_info->info.ddl.classid == ProcedureRelationId)
         {
-            resource_type = "Routine"; /* Using Routine to match MySQL */
-            /* Simplified helper for function name lookup */
-            proc_name = get_func_name(auth_info->info.ddl.objectid);
-            if (proc_name)
-            {
+            resource_type = "Routine";
+            char *proc_name = get_func_name(auth_info->info.ddl.objectid);
+            if (proc_name) {
                 appendStringInfoString(&resource_id, proc_name);
                 pfree(proc_name);
-            }
-            else
-            {
-                appendStringInfo(&resource_id, "oid_%u",
-                                 auth_info->info.ddl.objectid);
-            }
+            } else
+                appendStringInfo(&resource_id, "oid_%u", auth_info->info.ddl.objectid);
         }
         else
         {
             resource_type = "Object";
-            appendStringInfo(&resource_id, "class_%u_oid_%u",
-                             auth_info->info.ddl.classid,
-                             auth_info->info.ddl.objectid);
+            appendStringInfo(&resource_id, "class_%u_oid_%u", auth_info->info.ddl.classid, auth_info->info.ddl.objectid);
         }
     }
     break;
@@ -958,21 +849,12 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
     return PG_AUTH_RESULT_IGNORE;
   }
 
-  /* 
-   * Iterate over all required permissions and check each one.
-   * If ANY permission is denied or errors, we return that result.
-   * ALL permissions must be granted to return GRANT.
-   */
   if (check_perms_loop) {
       int i;
-      
-      /* If no permissions required (shouldn't happen), assume GRANT */
       if (required_perms == 0) {
           pfree(resource_id.data);
           return PG_AUTH_RESULT_GRANT;
       }
-
-      /* Default to DENY if any checks are performed */
       result = PG_AUTH_RESULT_DENY;
 
       for (i = 0; i < 32; i++) {
@@ -984,39 +866,22 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
                       "User", auth_info->rolename ? auth_info->rolename : "unknown", 
                       action,
                       resource_type, resource_id.data);
-                      
-                  if (cedar_log_decisions) {
-                    ereport(LOG, (errmsg("pg_authorization: event=%s, user=%s, action=%s, "
-                                         "resource=%s::%s, result=%s",
-                                         GetAuthorizationEventTypeName(auth_info->event_type),
-                                         auth_info->rolename ? auth_info->rolename : "unknown",
-                                         action, resource_type, resource_id.data,
-                                         GetAuthorizationResultName(result))));
-                  }
-
                   if (result != PG_AUTH_RESULT_GRANT) {
-                      /* Deny or Ignore/Error -> stop and return this result */
                       pfree(resource_id.data);
                       return result;
                   }
               }
           }
       }
-      /* If we get here, all checked permissions were granted */
       result = PG_AUTH_RESULT_GRANT;
   }
 
   pfree(resource_id.data);
-
   return result;
 }
 
 /* --------------------------------------------------------------------------
  * Object access hook callback
- *
- * Called for DDL operations (CREATE, ALTER, DROP, etc.)
- * ONLY handles entity synchronization to Cedar Agent.
- * Authorization is handled via universal_authorization_hook in aclchk.c.
  * --------------------------------------------------------------------------
  */
 static void cedar_object_access_hook(ObjectAccessType access, Oid classId,
@@ -1025,73 +890,51 @@ static void cedar_object_access_hook(ObjectAccessType access, Oid classId,
   char *entity_id = NULL;
   char *schema_name = NULL;
 
-  /* Chain to previous hook first */
   if (prev_object_access_hook)
     prev_object_access_hook(access, classId, objectId, subId, arg);
 
-  /* Check if plugin is enabled */
   if (!cedar_authorization_enabled && !cedar_entity_sync_enabled)
     return;
 
-  /* Check if URL is configured */
   if (cedar_agent_url == NULL || cedar_agent_url[0] == '\0')
     return;
 
-  /*
-   * Handle entity synchronization for CREATE, ALTER, DROP
-   */
   if (cedar_entity_sync_enabled) {
+    /* When an entity changes, we should invalidate our cache */
+    reset_auth_cache();
+
     switch (classId) {
     case RelationRelationId:
-      /* Table/Relation */
       {
         char relkind = get_rel_relkind(objectId);
-
-        /* If syscache lookup fails (e.g. during OAT_POST_CREATE), try opening relation */
         if (relkind == '\0') {
           Relation rel = relation_open(objectId, NoLock);
           relkind = rel->rd_rel->relkind;
           relation_close(rel, NoLock);
         }
-
-        /* Filter out indexes, sequences, toast tables, etc. */
-        if (relkind != RELKIND_RELATION && 
-            relkind != RELKIND_VIEW &&
-            relkind != RELKIND_MATVIEW &&
-            relkind != RELKIND_PARTITIONED_TABLE)
+        if (relkind != RELKIND_RELATION && relkind != RELKIND_VIEW &&
+            relkind != RELKIND_MATVIEW && relkind != RELKIND_PARTITIONED_TABLE)
           break;
 
         entity_type = "Table";
-        Oid namespace_oid = InvalidOid;
+        Oid ns_oid = InvalidOid;
         char *rel_name = get_rel_name(objectId);
-
-        if (rel_name) {
-          namespace_oid = get_rel_namespace(objectId);
-        } else {
-          /*
-           * If syscache lookup fails (e.g. during OAT_POST_CREATE),
-           * try opening the relation directly.
-           */
+        if (rel_name) ns_oid = get_rel_namespace(objectId);
+        else {
           Relation rel = relation_open(objectId, NoLock);
           rel_name = pstrdup(RelationGetRelationName(rel));
-          namespace_oid = RelationGetNamespace(rel);
+          ns_oid = RelationGetNamespace(rel);
           relation_close(rel, NoLock);
         }
-
         if (rel_name) {
-          schema_name = get_namespace_name(namespace_oid);
-          if (schema_name) {
-            entity_id = psprintf("%s.%s", schema_name, rel_name);
-          } else {
-            entity_id = pstrdup(rel_name);
-          }
+          schema_name = get_namespace_name(ns_oid);
+          entity_id = schema_name ? psprintf("%s.%s", schema_name, rel_name) : pstrdup(rel_name);
           pfree(rel_name);
         }
       }
       break;
 
     case NamespaceRelationId:
-      /* Schema */
       {
         HeapTuple tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(objectId));
         if (HeapTupleIsValid(tup)) {
@@ -1104,15 +947,11 @@ static void cedar_object_access_hook(ObjectAccessType access, Oid classId,
       break;
 
     case AuthIdRelationId:
-      /* User/Role */
       entity_type = "User";
       {
-        HeapTuple roleTup;
-
-        roleTup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(objectId));
+        HeapTuple roleTup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(objectId));
         if (HeapTupleIsValid(roleTup)) {
           Form_pg_authid roleForm = (Form_pg_authid)GETSTRUCT(roleTup);
-
           entity_id = pstrdup(NameStr(roleForm->rolname));
           ReleaseSysCache(roleTup);
         }
@@ -1120,68 +959,40 @@ static void cedar_object_access_hook(ObjectAccessType access, Oid classId,
       break;
 
     case DatabaseRelationId:
-      /* Database */
       entity_type = "Database";
       entity_id = get_database_name(objectId);
       break;
 
     case ProcedureRelationId:
-      /* Function/Procedure */
-      entity_type = "Routine"; /* Using Routine to match MySQL */
+      entity_type = "Routine";
       {
-        HeapTuple procTup;
-
-        procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(objectId));
+        HeapTuple procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(objectId));
         if (HeapTupleIsValid(procTup)) {
           Form_pg_proc procForm = (Form_pg_proc)GETSTRUCT(procTup);
-
           schema_name = get_namespace_name(procForm->pronamespace);
-          if (schema_name) {
-            entity_id =
-                psprintf("%s.%s", schema_name, NameStr(procForm->proname));
-          } else {
-            entity_id = pstrdup(NameStr(procForm->proname));
-          }
+          entity_id = schema_name ? psprintf("%s.%s", schema_name, NameStr(procForm->proname)) : pstrdup(NameStr(procForm->proname));
           ReleaseSysCache(procTup);
         }
       }
       break;
 
-    default:
-      /* Other object types - skip sync */
-      break;
+    default: break;
     }
 
-    /* Perform entity sync if we identified the entity */
     if (entity_type && entity_id) {
       switch (access) {
       case OAT_POST_CREATE:
       case OAT_POST_ALTER:
-        ereport(DEBUG1, (errmsg("pg_authorization: syncing %s %s (access=%d)", entity_type, entity_id, (int)access)));
         cedar_sync_entity_upsert(entity_type, entity_id);
         break;
-
       case OAT_DROP:
-        ereport(DEBUG1, (errmsg("pg_authorization: deleting %s %s", entity_type, entity_id)));
         cedar_sync_entity_delete(entity_type, entity_id);
         break;
-
-      default:
-        /* Other access types don't need sync */
-        break;
-      }
-    } else {
-      /* Log skipped sync for debugging */
-      if (access == OAT_POST_CREATE || access == OAT_DROP) {
-        ereport(DEBUG2, (errmsg("pg_authorization: skipping sync for classId=%u, access=%d", (unsigned int)classId, (int)access)));
+      default: break;
       }
     }
-
-    /* Cleanup */
-    if (entity_id && entity_id != schema_name)
-      pfree(entity_id);
-    if (schema_name)
-      pfree(schema_name);
+    if (entity_id && entity_id != schema_name) pfree(entity_id);
+    if (schema_name) pfree(schema_name);
   }
 }
 
@@ -1194,53 +1005,97 @@ cedar_process_utility_hook(PlannedStmt *pstmt, const char *queryString,
                            bool readOnlyTree, ProcessUtilityContext context,
                            ParamListInfo params, QueryEnvironment *queryEnv,
                            DestReceiver *dest, QueryCompletion *qc) {
-  /*
-   * We do not enforce authorization here anymore because most utility commands
-   * perform ACL checks which are intercepted by our hook in aclchk.c.
-   * Enforcing here would be redundant and might block valid operations
-   * (e.g. if native check passes but we check Cedar prematurely).
-   */
-
-  /* Chain to next hook or standard processing */
   if (prev_process_utility_hook)
-    prev_process_utility_hook(pstmt, queryString, readOnlyTree, context, params,
-                              queryEnv, dest, qc);
+    prev_process_utility_hook(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
   else
-    standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params,
-                            queryEnv, dest, qc);
+    standard_ProcessUtility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
 
-  /*
-   * Entity sync fallback for roles/users.
-   *
-   * In core Postgres, role creation invokes object_access_hook via
-   * InvokeObjectPostCreateHook(AuthIdRelationId, roleid, 0) (see user.c),
-   * but the catalog tuple may not be visible via syscache at that moment.
-   * That means our OAT_POST_CREATE path can fail to resolve the rolename and
-   * we end up not creating the corresponding Cedar entity.
-   *
-   * ProcessUtility_hook sees the parsed CreateRoleStmt (with the role name)
-   * and runs after the command has executed, so it's a reliable place to
-   * perform the upsert and match MySQL ddl_audit behavior.
-   */
-  if (cedar_entity_sync_enabled &&
-      cedar_agent_url != NULL && cedar_agent_url[0] != '\0' &&
+  if (cedar_entity_sync_enabled && cedar_agent_url != NULL && cedar_agent_url[0] != '\0' &&
       pstmt != NULL && pstmt->utilityStmt != NULL) {
     Node *parsetree = (Node *) pstmt->utilityStmt;
-
     if (IsA(parsetree, CreateRoleStmt)) {
       CreateRoleStmt *stmt = (CreateRoleStmt *) parsetree;
-
-      if (stmt->role && stmt->role[0] != '\0') {
-        cedar_sync_entity_upsert("User", stmt->role);
-      }
+      if (stmt->role && stmt->role[0] != '\0') cedar_sync_entity_upsert("User", stmt->role);
     } else if (IsA(parsetree, CreateSchemaStmt)) {
       CreateSchemaStmt *stmt = (CreateSchemaStmt *) parsetree;
-
-      if (stmt->schemaname && stmt->schemaname[0] != '\0') {
-        cedar_sync_entity_upsert("Schema", stmt->schemaname);
-      }
+      if (stmt->schemaname && stmt->schemaname[0] != '\0') cedar_sync_entity_upsert("Schema", stmt->schemaname);
     }
+    /* Any utility command might change permissions, so reset cache */
+    reset_auth_cache();
   }
+}
+
+/* --------------------------------------------------------------------------
+ * Authorization Cache Management
+ * --------------------------------------------------------------------------
+ */
+static void init_auth_cache(void) {
+  HASHCTL ctl;
+  memset(&ctl, 0, sizeof(ctl));
+  ctl.keysize = sizeof(AuthCacheKey);
+  ctl.entrysize = sizeof(AuthCacheEntry);
+  auth_cache = hash_create("Cedar Authorization Cache", cedar_cache_size, &ctl, HASH_ELEM | HASH_BLOBS);
+}
+
+static void reset_auth_cache(void) {
+  if (auth_cache == NULL) return;
+  hash_destroy(auth_cache);
+  init_auth_cache();
+}
+
+static AuthorizationResult check_auth_cache(const char *rolename, const char *action,
+                                           const char *res_type, const char *res_id) {
+  AuthCacheKey key;
+  AuthCacheEntry *entry;
+  TimestampTz now = GetCurrentTimestamp();
+
+  if (!cedar_cache_enabled || auth_cache == NULL) return PG_AUTH_RESULT_IGNORE;
+
+  memset(&key, 0, sizeof(key));
+  strncpy(key.rolename, rolename ? rolename : "unknown", NAMEDATALEN - 1);
+  strncpy(key.action, action, 63);
+  strncpy(key.resource_type, res_type, 63);
+  strncpy(key.resource_id, res_id, 255);
+
+  entry = (AuthCacheEntry *) hash_search(auth_cache, &key, HASH_FIND, NULL);
+  if (entry != NULL) {
+    if (now < entry->expires) {
+      stats_cache_hits++;
+      return entry->result;
+    }
+    /* Expired */
+    hash_search(auth_cache, &key, HASH_REMOVE, NULL);
+  }
+
+  stats_cache_misses++;
+  return PG_AUTH_RESULT_IGNORE;
+}
+
+static void update_auth_cache(const char *rolename, const char *action,
+                             const char *res_type, const char *res_id,
+                             AuthorizationResult result) {
+  AuthCacheKey key;
+  AuthCacheEntry *entry;
+  bool found;
+
+  if (!cedar_cache_enabled) return;
+  if (auth_cache == NULL) init_auth_cache();
+
+  /* Basic eviction: if cache is full, reset it (simplest way for now) */
+  if (hash_get_num_entries(auth_cache) >= cedar_cache_size) {
+    stats_cache_evictions++;
+    reset_auth_cache();
+  }
+
+  memset(&key, 0, sizeof(key));
+  strncpy(key.rolename, rolename ? rolename : "unknown", NAMEDATALEN - 1);
+  strncpy(key.action, action, 63);
+  strncpy(key.resource_type, res_type, 63);
+  strncpy(key.resource_id, res_id, 255);
+
+  entry = (AuthCacheEntry *) hash_search(auth_cache, &key, HASH_ENTER, &found);
+  entry->result = result;
+  entry->expires = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cedar_cache_ttl * 1000);
 }
 
 /* --------------------------------------------------------------------------
@@ -1248,15 +1103,11 @@ cedar_process_utility_hook(PlannedStmt *pstmt, const char *queryString,
  * --------------------------------------------------------------------------
  */
 void _PG_init(void) {
-  /* Initialize libcurl */
   curl_global_init(CURL_GLOBAL_ALL);
 
-  /* Define GUC variables */
   DefineCustomStringVariable(
       "pg_authorization.cedar_agent_url", "Base URL of the Cedar Agent service",
-      "When set, authorization requests are sent to this Cedar Agent. "
-      "Example: http://localhost:8180",
-      &cedar_agent_url, "", PGC_SIGHUP, 0, NULL, NULL, NULL);
+      NULL, &cedar_agent_url, "", PGC_SIGHUP, 0, NULL, NULL, NULL);
 
   DefineCustomIntVariable("pg_authorization.timeout",
                           "Timeout for Cedar Agent requests in milliseconds",
@@ -1265,30 +1116,38 @@ void _PG_init(void) {
 
   DefineCustomStringVariable(
       "pg_authorization.namespace", "Namespace for Cedar authorization",
-      "When set, all entities and actions are prefixed with this namespace. "
-      "Example: PostgreSQL",
-      &cedar_namespace, "", PGC_SIGHUP, 0, NULL, NULL, NULL);
+      NULL, &cedar_namespace, "", PGC_SIGHUP, 0, NULL, NULL, NULL);
 
   DefineCustomBoolVariable("pg_authorization.enabled",
-                           "Enable or disable Cedar authorization checks", NULL,
+                           "Enable Cedar authorization checks", NULL,
                            &cedar_authorization_enabled, true, PGC_SIGHUP, 0,
                            NULL, NULL, NULL);
 
   DefineCustomBoolVariable(
       "pg_authorization.entity_sync_enabled",
-      "Enable or disable entity synchronization to Cedar Agent",
-      "When enabled, CREATE/ALTER/DROP operations sync entities to Cedar.",
+      "Enable entity synchronization to Cedar Agent", NULL,
       &cedar_entity_sync_enabled, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
   DefineCustomBoolVariable(
       "pg_authorization.log_decisions",
-      "Log authorization decisions and Cedar Agent requests",
-      "When enabled, all authorization decisions are logged.",
-      &cedar_log_decisions, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
+      "Log authorization decisions", NULL,
+      &cedar_log_decisions, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+  /* Cache GUCs */
+  DefineCustomBoolVariable(
+      "pg_authorization.cache_enabled", "Enable authorization caching", NULL,
+      &cedar_cache_enabled, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+  DefineCustomIntVariable(
+      "pg_authorization.cache_size", "Maximum number of entries in auth cache", NULL,
+      &cedar_cache_size, 1024, 64, 100000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+  DefineCustomIntVariable(
+      "pg_authorization.cache_ttl", "TTL for cache entries in seconds", NULL,
+      &cedar_cache_ttl, 300, 1, 86400, PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
 
   MarkGUCPrefixReserved("pg_authorization");
 
-  /* Install hooks */
   prev_object_access_hook = object_access_hook;
   object_access_hook = cedar_object_access_hook;
 
@@ -1298,43 +1157,38 @@ void _PG_init(void) {
   prev_universal_auth_hook = universal_authorization_hook;
   universal_authorization_hook = cedar_authorization_hook;
 
-  ereport(LOG, (errmsg("pg_authorization: extension loaded"),
-                errdetail("Cedar authorization and entity sync enabled.")));
+  init_auth_cache();
+
+  ereport(LOG, (errmsg("pg_authorization: extension loaded")));
+}
+
+void _PG_fini(void) {
+  if (persistent_curl) {
+    curl_easy_cleanup(persistent_curl);
+    persistent_curl = NULL;
+  }
+  curl_global_cleanup();
 }
 
 /* --------------------------------------------------------------------------
- * SQL-callable function: Check if the plugin is enabled
+ * SQL Functions
  * --------------------------------------------------------------------------
  */
-Datum pg_authorization_is_enabled(PG_FUNCTION_ARGS) {
-  PG_RETURN_BOOL(cedar_authorization_enabled);
-}
+Datum pg_authorization_is_enabled(PG_FUNCTION_ARGS) { PG_RETURN_BOOL(cedar_authorization_enabled); }
 
-/* --------------------------------------------------------------------------
- * SQL-callable function: Get authorization statistics
- * --------------------------------------------------------------------------
- */
 Datum pg_authorization_stats(PG_FUNCTION_ARGS) {
-  TupleDesc tupdesc;
+  TupleDesc tupdesc = CreateTemplateTupleDesc(8);
   Datum values[8];
-  bool nulls[8];
-  HeapTuple tuple;
-
-  /* Build tuple descriptor */
-  tupdesc = CreateTemplateTupleDesc(8);
-  TupleDescInitEntry(tupdesc, (AttrNumber)1, "auth_requests", INT8OID, -1, 0);
-  TupleDescInitEntry(tupdesc, (AttrNumber)2, "auth_grants", INT8OID, -1, 0);
-  TupleDescInitEntry(tupdesc, (AttrNumber)3, "auth_denies", INT8OID, -1, 0);
-  TupleDescInitEntry(tupdesc, (AttrNumber)4, "auth_ignores", INT8OID, -1, 0);
-  TupleDescInitEntry(tupdesc, (AttrNumber)5, "auth_errors", INT8OID, -1, 0);
-  TupleDescInitEntry(tupdesc, (AttrNumber)6, "sync_requests", INT8OID, -1, 0);
-  TupleDescInitEntry(tupdesc, (AttrNumber)7, "sync_successes", INT8OID, -1, 0);
-  TupleDescInitEntry(tupdesc, (AttrNumber)8, "sync_failures", INT8OID, -1, 0);
-
+  bool nulls[8] = {false};
+  TupleDescInitEntry(tupdesc, 1, "auth_requests", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 2, "auth_grants", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 3, "auth_denies", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 4, "auth_ignores", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 5, "auth_errors", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 6, "sync_requests", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 7, "sync_successes", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 8, "sync_failures", INT8OID, -1, 0);
   tupdesc = BlessTupleDesc(tupdesc);
-
-  /* Fill in values */
-  memset(nulls, 0, sizeof(nulls));
   values[0] = Int64GetDatum(stats_auth_requests);
   values[1] = Int64GetDatum(stats_auth_grants);
   values[2] = Int64GetDatum(stats_auth_denies);
@@ -1343,44 +1197,41 @@ Datum pg_authorization_stats(PG_FUNCTION_ARGS) {
   values[5] = Int64GetDatum(stats_sync_requests);
   values[6] = Int64GetDatum(stats_sync_successes);
   values[7] = Int64GetDatum(stats_sync_failures);
-
-  tuple = heap_form_tuple(tupdesc, values, nulls);
-
-  PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+  PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
-/* --------------------------------------------------------------------------
- * SQL-callable function: Reset authorization statistics
- * --------------------------------------------------------------------------
- */
 Datum pg_authorization_reset_stats(PG_FUNCTION_ARGS) {
-  stats_auth_requests = 0;
-  stats_auth_grants = 0;
-  stats_auth_denies = 0;
-  stats_auth_ignores = 0;
-  stats_auth_errors = 0;
-  stats_sync_requests = 0;
-  stats_sync_successes = 0;
-  stats_sync_failures = 0;
-
+  stats_auth_requests = stats_auth_grants = stats_auth_denies = stats_auth_ignores = stats_auth_errors = 0;
+  stats_sync_requests = stats_sync_successes = stats_sync_failures = 0;
   PG_RETURN_VOID();
 }
 
-/* --------------------------------------------------------------------------
- * SQL-callable function: Manually sync an entity to Cedar Agent
- * --------------------------------------------------------------------------
- */
 Datum pg_authorization_sync_entity(PG_FUNCTION_ARGS) {
-  text *entity_type_text = PG_GETARG_TEXT_PP(0);
-  text *entity_id_text = PG_GETARG_TEXT_PP(1);
-  char *entity_type = text_to_cstring(entity_type_text);
-  char *entity_id = text_to_cstring(entity_id_text);
-  bool success;
+  char *type = text_to_cstring(PG_GETARG_TEXT_PP(0));
+  char *id = text_to_cstring(PG_GETARG_TEXT_PP(1));
+  bool res = cedar_sync_entity_upsert(type, id);
+  pfree(type); pfree(id);
+  PG_RETURN_BOOL(res);
+}
 
-  success = cedar_sync_entity_upsert(entity_type, entity_id);
+Datum pg_authorization_cache_stats(PG_FUNCTION_ARGS) {
+  TupleDesc tupdesc = CreateTemplateTupleDesc(4);
+  Datum values[4];
+  bool nulls[4] = {false};
+  TupleDescInitEntry(tupdesc, 1, "hits", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 2, "misses", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 3, "evictions", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 4, "entries", INT8OID, -1, 0);
+  tupdesc = BlessTupleDesc(tupdesc);
+  values[0] = Int64GetDatum(stats_cache_hits);
+  values[1] = Int64GetDatum(stats_cache_misses);
+  values[2] = Int64GetDatum(stats_cache_evictions);
+  values[3] = Int64GetDatum(auth_cache ? hash_get_num_entries(auth_cache) : 0);
+  PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
 
-  pfree(entity_type);
-  pfree(entity_id);
-
-  PG_RETURN_BOOL(success);
+Datum pg_authorization_cache_reset(PG_FUNCTION_ARGS) {
+  reset_auth_cache();
+  stats_cache_hits = stats_cache_misses = stats_cache_evictions = 0;
+  PG_RETURN_VOID();
 }

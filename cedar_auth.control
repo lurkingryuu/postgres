@@ -1,5 +1,0 @@
-# PostgreSQL extension control file for Cedar authorization
-comment = 'Cedar Policy Decision Point integration for PostgreSQL'
-default_version = '1.0'
-module_pathname = '$libdir/cedar_auth'
-relocatable = false

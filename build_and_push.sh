@@ -29,8 +29,8 @@ fi
 REQUIRED_FILES=(
     "postgres-cedar.Dockerfile"
     "postgres-init.sql"
-    "cedar_auth.control"
-    "cedar_auth--1.0.sql"
+    "contrib/pg_authorization/pg_authorization.control"
+    "contrib/pg_authorization/pg_authorization--1.0.sql"
 )
 
 echo "Checking required files..."

@@ -51,9 +51,7 @@ RUN ./configure \
     && make -j$(nproc) \
     && make -j$(nproc) -C contrib \
     && make install \
-    && make -C contrib install \
-    && cp cedar_auth.control /usr/local/pgsql/share/extension/ \
-    && cp cedar_auth--1.0.sql /usr/local/pgsql/share/extension/
+    && make -C contrib install
 
 # Final stage: Use the official PostgreSQL 17.7 image as base
 # This provides the entrypoint, default configuration, and standard environment
@@ -91,7 +89,6 @@ RUN mkdir -p /usr/lib/postgresql/17/lib/ && \
     ln -sf /usr/local/pgsql/lib/pg_authorization.so /usr/lib/postgresql/17/lib/pg_authorization.so && \
     mkdir -p /usr/share/postgresql/17/extension/ && \
     ln -sf /usr/local/pgsql/share/extension/pg_authorization* /usr/share/postgresql/17/extension/ && \
-    ln -sf /usr/local/pgsql/share/extension/cedar_auth* /usr/share/postgresql/17/extension/ && \
     ln -sf /usr/local/pgsql/bin/postgres /usr/lib/postgresql/17/bin/postgres && \
     ln -sf /usr/local/pgsql/bin/pg_config /usr/lib/postgresql/17/bin/pg_config
 
