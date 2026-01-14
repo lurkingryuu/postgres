@@ -66,6 +66,9 @@
 #include "utils/syscache.h"
 #include "utils/hsearch.h"
 #include "utils/timestamp.h"
+#include "storage/ipc.h"
+#include "storage/shmem.h"
+#include "storage/lwlock.h"
 
 PG_MODULE_MAGIC;
 
@@ -95,24 +98,34 @@ static int cedar_cache_size = 1024;
 static int cedar_cache_ttl = 300; /* seconds */
 
 /* --------------------------------------------------------------------------
- * Statistics counters
+ * Statistics counters (in shared memory)
  * --------------------------------------------------------------------------
  */
-static volatile long stats_auth_requests = 0;
-static volatile long stats_auth_grants = 0;
-static volatile long stats_auth_denies = 0;
-static volatile long stats_auth_ignores = 0;
-static volatile long stats_auth_errors = 0;
-static volatile double stats_auth_total_time = 0;   /* Total time in seconds */
-static volatile double stats_auth_remote_time = 0;  /* Server-side time in seconds */
-static volatile long stats_sync_requests = 0;
-static volatile long stats_sync_successes = 0;
-static volatile long stats_sync_failures = 0;
+typedef struct pg_auth_stats_t
+{
+	long auth_requests;
+	long auth_grants;
+	long auth_denies;
+	long auth_ignores;
+	long auth_errors;
+	double auth_total_time;
+	double auth_remote_time;
+	long sync_requests;
+	long sync_successes;
+	long sync_failures;
+} pg_auth_stats_t;
 
-/* Cache statistics */
-static volatile long stats_cache_hits = 0;
-static volatile long stats_cache_misses = 0;
-static volatile long stats_cache_evictions = 0;
+static pg_auth_stats_t *stats = NULL;
+
+/* Cache statistics (also in shared memory) */
+typedef struct pg_cache_stats_t
+{
+	long hits;
+	long misses;
+	long evictions;
+} pg_cache_stats_t;
+
+static pg_cache_stats_t *cache_stats = NULL;
 
 /* --------------------------------------------------------------------------
  * Internal state
@@ -120,6 +133,65 @@ static volatile long stats_cache_evictions = 0;
  */
 static CURL *persistent_curl = NULL;
 static HTAB *auth_cache = NULL;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+/* --------------------------------------------------------------------------
+ * Shared Memory Management
+ * --------------------------------------------------------------------------
+ */
+static size_t
+pg_auth_shmem_size(void)
+{
+	size_t size;
+
+	size = MAXALIGN(sizeof(pg_auth_stats_t));
+	size = add_size(size, MAXALIGN(sizeof(pg_cache_stats_t)));
+
+	return size;
+}
+
+static void
+pg_auth_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+
+	RequestAddinShmemSpace(pg_auth_shmem_size());
+}
+
+static void
+pg_auth_shmem_startup(void)
+{
+	bool found;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+	stats = (pg_auth_stats_t *)
+		ShmemInitStruct("pg_authorization_stats",
+						sizeof(pg_auth_stats_t),
+						&found);
+
+	if (!found)
+	{
+		memset(stats, 0, sizeof(pg_auth_stats_t));
+	}
+
+	cache_stats = (pg_cache_stats_t *)
+		ShmemInitStruct("pg_authorization_cache_stats",
+						sizeof(pg_cache_stats_t),
+						&found);
+
+	if (!found)
+	{
+		memset(cache_stats, 0, sizeof(pg_cache_stats_t));
+	}
+
+	LWLockRelease(AddinShmemInitLock);
+}
 
 /* Cache structures */
 typedef struct AuthCacheKey {
@@ -343,7 +415,7 @@ static AuthorizationResult cedar_call_is_authorized_internal(const char *princip
     persistent_curl = curl_easy_init();
     if (!persistent_curl) {
       ereport(WARNING, (errmsg("pg_authorization: failed to initialize curl")));
-      stats_auth_errors++;
+      stats->auth_errors++;
       return PG_AUTH_RESULT_IGNORE;
     }
   } else {
@@ -413,7 +485,7 @@ static AuthorizationResult cedar_call_is_authorized_internal(const char *princip
   if (res != CURLE_OK) {
     ereport(LOG, (errmsg("pg_authorization: curl request failed: %s",
                              curl_easy_strerror(res))));
-    stats_auth_errors++;
+    stats->auth_errors++;
     result = PG_AUTH_RESULT_IGNORE;
   } else {
     double total_time;
@@ -425,25 +497,25 @@ static AuthorizationResult cedar_call_is_authorized_internal(const char *princip
     curl_easy_getinfo(persistent_curl, CURLINFO_STARTTRANSFER_TIME, &start_transfer_time);
     curl_easy_getinfo(persistent_curl, CURLINFO_PRETRANSFER_TIME, &pre_transfer_time);
 
-    stats_auth_total_time += total_time;
-    stats_auth_remote_time += (start_transfer_time - pre_transfer_time);
+    stats->auth_total_time += total_time;
+    stats->auth_remote_time += (start_transfer_time - pre_transfer_time);
 
     appendStringInfoChar(&response_body, '\0');
 
     if (response_code == 200) {
       if (strstr(response_body.data, "\"Allow\"") != NULL) {
         result = PG_AUTH_RESULT_GRANT;
-        stats_auth_grants++;
+        stats->auth_grants++;
       } else if (strstr(response_body.data, "\"Deny\"") != NULL) {
         result = PG_AUTH_RESULT_DENY;
-        stats_auth_denies++;
+        stats->auth_denies++;
       } else {
         result = PG_AUTH_RESULT_IGNORE;
-        stats_auth_ignores++;
+        stats->auth_ignores++;
       }
     } else {
       ereport(WARNING, (errmsg("pg_authorization: Cedar Agent returned status %ld", response_code)));
-      stats_auth_errors++;
+      stats->auth_errors++;
       result = PG_AUTH_RESULT_IGNORE;
     }
   }
@@ -472,7 +544,7 @@ static AuthorizationResult cedar_call_is_authorized(const char *principal_type,
   if (result != PG_AUTH_RESULT_IGNORE)
     return result;
 
-  stats_auth_requests++;
+  stats->auth_requests++;
 
   /* Cache miss - call agent */
   result = cedar_call_is_authorized_internal(principal_type, principal_id, action, resource_type, resource_id);
@@ -506,7 +578,7 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
       cedar_agent_url[0] == '\0')
     return false;
 
-  stats_sync_requests++;
+  stats->sync_requests++;
 
   if (persistent_curl == NULL) {
     persistent_curl = curl_easy_init();
@@ -567,17 +639,17 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
 
   if (res != CURLE_OK) {
     ereport(WARNING, (errmsg("pg_authorization: entity sync failed: %s", curl_easy_strerror(res))));
-    stats_sync_failures++;
+    stats->sync_failures++;
   } else {
     curl_easy_getinfo(persistent_curl, CURLINFO_RESPONSE_CODE, &response_code);
     if (response_code >= 200 && response_code < 300) {
-      stats_sync_successes++;
+      stats->sync_successes++;
       success = true;
     } else if (response_code == 409) {
-      stats_sync_successes++;
+      stats->sync_successes++;
       success = true;
     } else {
-      stats_sync_failures++;
+      stats->sync_failures++;
     }
   }
 
@@ -609,7 +681,7 @@ static bool cedar_sync_entity_delete(const char *entity_type,
       cedar_agent_url[0] == '\0')
     return false;
 
-  stats_sync_requests++;
+  stats->sync_requests++;
 
   if (persistent_curl == NULL) {
     persistent_curl = curl_easy_init();
@@ -661,17 +733,17 @@ static bool cedar_sync_entity_delete(const char *entity_type,
 
   if (res != CURLE_OK) {
     ereport(WARNING, (errmsg("pg_authorization: entity delete failed: %s", curl_easy_strerror(res))));
-    stats_sync_failures++;
+    stats->sync_failures++;
   } else {
     curl_easy_getinfo(persistent_curl, CURLINFO_RESPONSE_CODE, &response_code);
     if (response_code >= 200 && response_code < 300) {
-      stats_sync_successes++;
+      stats->sync_successes++;
       success = true;
     } else if (response_code == 404) {
-      stats_sync_successes++;
+      stats->sync_successes++;
       success = true;
     } else {
-      stats_sync_failures++;
+      stats->sync_failures++;
     }
   }
 
@@ -696,6 +768,8 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
   bool check_perms_loop = false;
   char *resolved_rolename = NULL;
   const char *rolename = auth_info->rolename;
+
+  ereport(LOG, (errmsg("pg_authorization: hook called for event %d", auth_info->event_type)));
 
   if (prev_universal_auth_hook) {
     result = prev_universal_auth_hook(auth_info);
@@ -1116,14 +1190,14 @@ static AuthorizationResult check_auth_cache(const char *rolename, const char *ac
   entry = (AuthCacheEntry *) hash_search(auth_cache, &key, HASH_FIND, NULL);
   if (entry != NULL) {
     if (now < entry->expires) {
-      stats_cache_hits++;
+      cache_stats->hits++;
       return entry->result;
     }
     /* Expired */
     hash_search(auth_cache, &key, HASH_REMOVE, NULL);
   }
 
-  stats_cache_misses++;
+  cache_stats->misses++;
   return PG_AUTH_RESULT_IGNORE;
 }
 
@@ -1139,7 +1213,7 @@ static void update_auth_cache(const char *rolename, const char *action,
 
   /* Basic eviction: if cache is full, reset it (simplest way for now) */
   if (hash_get_num_entries(auth_cache) >= cedar_cache_size) {
-    stats_cache_evictions++;
+    cache_stats->evictions++;
     reset_auth_cache();
   }
 
@@ -1159,6 +1233,15 @@ static void update_auth_cache(const char *rolename, const char *action,
  * --------------------------------------------------------------------------
  */
 void _PG_init(void) {
+  if (!process_shared_preload_libraries_in_progress)
+    ereport(ERROR,
+            (errmsg("pg_authorization must be loaded via shared_preload_libraries")));
+
+  prev_shmem_request_hook = shmem_request_hook;
+  shmem_request_hook = pg_auth_shmem_request;
+  prev_shmem_startup_hook = shmem_startup_hook;
+  shmem_startup_hook = pg_auth_shmem_startup;
+
   curl_global_init(CURL_GLOBAL_ALL);
 
   DefineCustomStringVariable(
@@ -1247,18 +1330,18 @@ Datum pg_authorization_stats(PG_FUNCTION_ARGS) {
   TupleDescInitEntry(tupdesc, 9, "avg_total_time_ms", FLOAT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 10, "avg_remote_time_ms", FLOAT8OID, -1, 0);
   tupdesc = BlessTupleDesc(tupdesc);
-  values[0] = Int64GetDatum(stats_auth_requests);
-  values[1] = Int64GetDatum(stats_auth_grants);
-  values[2] = Int64GetDatum(stats_auth_denies);
-  values[3] = Int64GetDatum(stats_auth_ignores);
-  values[4] = Int64GetDatum(stats_auth_errors);
-  values[5] = Int64GetDatum(stats_sync_requests);
-  values[6] = Int64GetDatum(stats_sync_successes);
-  values[7] = Int64GetDatum(stats_sync_failures);
+  values[0] = Int64GetDatum(stats->auth_requests);
+  values[1] = Int64GetDatum(stats->auth_grants);
+  values[2] = Int64GetDatum(stats->auth_denies);
+  values[3] = Int64GetDatum(stats->auth_ignores);
+  values[4] = Int64GetDatum(stats->auth_errors);
+  values[5] = Int64GetDatum(stats->sync_requests);
+  values[6] = Int64GetDatum(stats->sync_successes);
+  values[7] = Int64GetDatum(stats->sync_failures);
   
-  if (stats_auth_requests > 0) {
-    values[8] = Float8GetDatum((stats_auth_total_time * 1000.0) / stats_auth_requests);
-    values[9] = Float8GetDatum((stats_auth_remote_time * 1000.0) / stats_auth_requests);
+  if (stats->auth_requests > 0) {
+    values[8] = Float8GetDatum((stats->auth_total_time * 1000.0) / stats->auth_requests);
+    values[9] = Float8GetDatum((stats->auth_remote_time * 1000.0) / stats->auth_requests);
   } else {
     values[8] = Float8GetDatum(0.0);
     values[9] = Float8GetDatum(0.0);
@@ -1268,9 +1351,9 @@ Datum pg_authorization_stats(PG_FUNCTION_ARGS) {
 }
 
 Datum pg_authorization_reset_stats(PG_FUNCTION_ARGS) {
-  stats_auth_requests = stats_auth_grants = stats_auth_denies = stats_auth_ignores = stats_auth_errors = 0;
-  stats_auth_total_time = stats_auth_remote_time = 0;
-  stats_sync_requests = stats_sync_successes = stats_sync_failures = 0;
+  stats->auth_requests = stats->auth_grants = stats->auth_denies = stats->auth_ignores = stats->auth_errors = 0;
+  stats->auth_total_time = stats->auth_remote_time = 0;
+  stats->sync_requests = stats->sync_successes = stats->sync_failures = 0;
   PG_RETURN_VOID();
 }
 
@@ -1291,16 +1374,16 @@ Datum pg_authorization_cache_stats(PG_FUNCTION_ARGS) {
   TupleDescInitEntry(tupdesc, 3, "evictions", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 4, "entries", INT8OID, -1, 0);
   tupdesc = BlessTupleDesc(tupdesc);
-  values[0] = Int64GetDatum(stats_cache_hits);
-  values[1] = Int64GetDatum(stats_cache_misses);
-  values[2] = Int64GetDatum(stats_cache_evictions);
+  values[0] = Int64GetDatum(cache_stats->hits);
+  values[1] = Int64GetDatum(cache_stats->misses);
+  values[2] = Int64GetDatum(cache_stats->evictions);
   values[3] = Int64GetDatum(auth_cache ? hash_get_num_entries(auth_cache) : 0);
   PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
 Datum pg_authorization_cache_reset(PG_FUNCTION_ARGS) {
   reset_auth_cache();
-  stats_cache_hits = stats_cache_misses = stats_cache_evictions = 0;
+  cache_stats->hits = cache_stats->misses = cache_stats->evictions = 0;
   PG_RETURN_VOID();
 }
 
