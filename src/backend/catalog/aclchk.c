@@ -119,6 +119,15 @@ InitAuthorizationInfo(AuthorizationInfo *info, AuthorizationEventType event_type
 	info->dbname = get_database_name(MyDatabaseId);
 }
 
+void
+FreeAuthorizationInfo(AuthorizationInfo *info)
+{
+	if (info->rolename)
+		pfree((void *) info->rolename);
+	if (info->dbname)
+		pfree((void *) info->dbname);
+}
+
 const char *
 GetAuthorizationEventTypeName(AuthorizationEventType event_type)
 {
@@ -3331,6 +3340,8 @@ object_aclmask_ext(Oid classid, Oid objectid, Oid roleid,
 				/* Hook granted access - grant all requested permissions */
 				result |= mask;
 			}
+
+			FreeAuthorizationInfo(&auth_info);
 		}
 	}
 
@@ -3497,6 +3508,8 @@ pg_attribute_aclmask_ext(Oid table_oid, AttrNumber attnum, Oid roleid,
 				/* Hook granted access - grant all requested permissions */
 				result |= mask;
 			}
+
+			FreeAuthorizationInfo(&auth_info);
 		}
 	}
 
@@ -3671,6 +3684,8 @@ pg_class_aclmask_ext(Oid table_oid, Oid roleid, AclMode mask,
 				/* Hook granted access - grant all requested permissions */
 				result |= mask;
 			}
+
+			FreeAuthorizationInfo(&auth_info);
 		}
 	}
 
@@ -4006,6 +4021,8 @@ pg_namespace_aclmask_ext(Oid nsp_oid, Oid roleid,
 				/* Hook granted access - grant all requested permissions */
 				result |= mask;
 			}
+
+			FreeAuthorizationInfo(&auth_info);
 		}
 	}
 
@@ -4167,6 +4184,8 @@ pg_type_aclmask_ext(Oid type_oid, Oid roleid, AclMode mask, AclMaskHow how,
 				/* Hook granted access - grant all requested permissions */
 				result |= mask;
 			}
+
+			FreeAuthorizationInfo(&auth_info);
 		}
 	}
 

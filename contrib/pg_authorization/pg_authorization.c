@@ -61,6 +61,7 @@
 #include "utils/authorization_hook.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 #include "utils/hsearch.h"
@@ -75,6 +76,7 @@ PG_FUNCTION_INFO_V1(pg_authorization_reset_stats);
 PG_FUNCTION_INFO_V1(pg_authorization_sync_entity);
 PG_FUNCTION_INFO_V1(pg_authorization_cache_stats);
 PG_FUNCTION_INFO_V1(pg_authorization_cache_reset);
+PG_FUNCTION_INFO_V1(pg_authorization_flush_syscache);
 
 /* --------------------------------------------------------------------------
  * GUC variables
@@ -101,6 +103,8 @@ static volatile long stats_auth_grants = 0;
 static volatile long stats_auth_denies = 0;
 static volatile long stats_auth_ignores = 0;
 static volatile long stats_auth_errors = 0;
+static volatile double stats_auth_total_time = 0;   /* Total time in seconds */
+static volatile double stats_auth_remote_time = 0;  /* Server-side time in seconds */
 static volatile long stats_sync_requests = 0;
 static volatile long stats_sync_successes = 0;
 static volatile long stats_sync_failures = 0;
@@ -412,7 +416,18 @@ static AuthorizationResult cedar_call_is_authorized_internal(const char *princip
     stats_auth_errors++;
     result = PG_AUTH_RESULT_IGNORE;
   } else {
+    double total_time;
+    double start_transfer_time;
+    double pre_transfer_time;
+
     curl_easy_getinfo(persistent_curl, CURLINFO_RESPONSE_CODE, &response_code);
+    curl_easy_getinfo(persistent_curl, CURLINFO_TOTAL_TIME, &total_time);
+    curl_easy_getinfo(persistent_curl, CURLINFO_STARTTRANSFER_TIME, &start_transfer_time);
+    curl_easy_getinfo(persistent_curl, CURLINFO_PRETRANSFER_TIME, &pre_transfer_time);
+
+    stats_auth_total_time += total_time;
+    stats_auth_remote_time += (start_transfer_time - pre_transfer_time);
+
     appendStringInfoChar(&response_body, '\0');
 
     if (response_code == 200) {
@@ -679,6 +694,8 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
   StringInfoData resource_id;
   AclMode required_perms = 0;
   bool check_perms_loop = false;
+  char *resolved_rolename = NULL;
+  const char *rolename = auth_info->rolename;
 
   if (prev_universal_auth_hook) {
     result = prev_universal_auth_hook(auth_info);
@@ -689,8 +706,35 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
   if (!cedar_authorization_enabled)
     return PG_AUTH_RESULT_IGNORE;
 
+  /* Superusers bypass external authorization */
+  if (superuser_arg(auth_info->roleid))
+    return PG_AUTH_RESULT_IGNORE;
+
   if (cedar_agent_url == NULL || cedar_agent_url[0] == '\0')
     return PG_AUTH_RESULT_IGNORE;
+
+  /* Ensure we have a valid role name for Cedar */
+  if (rolename == NULL || rolename[0] == '\0')
+  {
+      HeapTuple roleTup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(auth_info->roleid));
+      if (HeapTupleIsValid(roleTup))
+      {
+          Form_pg_authid roleForm = (Form_pg_authid) GETSTRUCT(roleTup);
+          resolved_rolename = pstrdup(NameStr(roleForm->rolname));
+          rolename = resolved_rolename;
+          ReleaseSysCache(roleTup);
+      }
+      else
+      {
+          rolename = "unknown";
+      }
+  }
+
+  if (cedar_log_decisions)
+  {
+      ereport(LOG, (errmsg("pg_authorization: check role %s (oid %u) for event %d", 
+                           rolename, auth_info->roleid, auth_info->event_type)));
+  }
 
   initStringInfo(&resource_id);
 
@@ -733,16 +777,15 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
           appendStringInfo(&resource_id, "oid_%u", auth_info->info.ddl.objectid);
           
         result = cedar_call_is_authorized(
-            "User", auth_info->rolename ? auth_info->rolename : "unknown", 
+            "User", rolename, 
             auth_info->info.ddl.command_tag,
             resource_type, resource_id.data);
             
-        pfree(resource_id.data);
-        return result;
+        goto cleanup;
     }
     else {
-        pfree(resource_id.data);
-        return PG_AUTH_RESULT_IGNORE;
+        result = PG_AUTH_RESULT_IGNORE;
+        goto cleanup;
     }
     break;
 
@@ -753,15 +796,20 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
 
         if (auth_info->info.ddl.classid == RelationRelationId)
         {
+            char *rel_name;
             if (auth_info->info.ddl.subid != 0)
             {
+                Oid ns_oid;
+                char *sch_name;
+                char *col_name;
+
                 resource_type = "Column";
-                char *rel_name = get_rel_name(auth_info->info.ddl.objectid);
+                rel_name = get_rel_name(auth_info->info.ddl.objectid);
                 if (rel_name)
                 {
-                    Oid ns_oid = get_rel_namespace(auth_info->info.ddl.objectid);
-                    char *sch_name = get_namespace_name(ns_oid);
-                    char *col_name = get_attname(auth_info->info.ddl.objectid, auth_info->info.ddl.subid, false);
+                    ns_oid = get_rel_namespace(auth_info->info.ddl.objectid);
+                    sch_name = get_namespace_name(ns_oid);
+                    col_name = get_attname(auth_info->info.ddl.objectid, auth_info->info.ddl.subid, false);
 
                     if (sch_name && col_name)
                         appendStringInfo(&resource_id, "%s.%s.%s", sch_name, rel_name, col_name);
@@ -780,7 +828,7 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
             else
             {
                 resource_type = "Table";
-                char *rel_name = get_rel_name(auth_info->info.ddl.objectid);
+                rel_name = get_rel_name(auth_info->info.ddl.objectid);
                 if (rel_name)
                 {
                     Oid ns_oid = get_rel_namespace(auth_info->info.ddl.objectid);
@@ -798,8 +846,9 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
         }
         else if (auth_info->info.ddl.classid == NamespaceRelationId)
         {
+            char *nsp_name;
             resource_type = "Schema";
-            char *nsp_name = get_namespace_name(auth_info->info.ddl.objectid);
+            nsp_name = get_namespace_name(auth_info->info.ddl.objectid);
             if (nsp_name) {
                 appendStringInfoString(&resource_id, nsp_name);
                 pfree(nsp_name);
@@ -808,8 +857,9 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
         }
         else if (auth_info->info.ddl.classid == TypeRelationId)
         {
+            char *type_name;
             resource_type = "Type";
-            char *type_name = format_type_be(auth_info->info.ddl.objectid);
+            type_name = format_type_be(auth_info->info.ddl.objectid);
             if (type_name) {
                 appendStringInfoString(&resource_id, type_name);
                 pfree(type_name);
@@ -818,8 +868,9 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
         }
         else if (auth_info->info.ddl.classid == DatabaseRelationId)
         {
+            char *db_name;
             resource_type = "Database";
-            char *db_name = get_database_name(auth_info->info.ddl.objectid);
+            db_name = get_database_name(auth_info->info.ddl.objectid);
             if (db_name) {
                 appendStringInfoString(&resource_id, db_name);
                 pfree(db_name);
@@ -828,8 +879,9 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
         }
         else if (auth_info->info.ddl.classid == ProcedureRelationId)
         {
+            char *proc_name;
             resource_type = "Routine";
-            char *proc_name = get_func_name(auth_info->info.ddl.objectid);
+            proc_name = get_func_name(auth_info->info.ddl.objectid);
             if (proc_name) {
                 appendStringInfoString(&resource_id, proc_name);
                 pfree(proc_name);
@@ -845,15 +897,15 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
     break;
 
   default:
-    pfree(resource_id.data);
-    return PG_AUTH_RESULT_IGNORE;
+    result = PG_AUTH_RESULT_IGNORE;
+    goto cleanup;
   }
 
   if (check_perms_loop) {
       int i;
       if (required_perms == 0) {
-          pfree(resource_id.data);
-          return PG_AUTH_RESULT_GRANT;
+          result = PG_AUTH_RESULT_GRANT;
+          goto cleanup;
       }
       result = PG_AUTH_RESULT_DENY;
 
@@ -863,12 +915,11 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
               const char *action = get_cedar_action_for_bit(bit);
               if (action) {
                   result = cedar_call_is_authorized(
-                      "User", auth_info->rolename ? auth_info->rolename : "unknown", 
+                      "User", rolename, 
                       action,
                       resource_type, resource_id.data);
                   if (result != PG_AUTH_RESULT_GRANT) {
-                      pfree(resource_id.data);
-                      return result;
+                      goto cleanup;
                   }
               }
           }
@@ -876,7 +927,9 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
       result = PG_AUTH_RESULT_GRANT;
   }
 
+cleanup:
   pfree(resource_id.data);
+  if (resolved_rolename) pfree(resolved_rolename);
   return result;
 }
 
@@ -916,20 +969,23 @@ static void cedar_object_access_hook(ObjectAccessType access, Oid classId,
             relkind != RELKIND_MATVIEW && relkind != RELKIND_PARTITIONED_TABLE)
           break;
 
-        entity_type = "Table";
-        Oid ns_oid = InvalidOid;
-        char *rel_name = get_rel_name(objectId);
-        if (rel_name) ns_oid = get_rel_namespace(objectId);
-        else {
-          Relation rel = relation_open(objectId, NoLock);
-          rel_name = pstrdup(RelationGetRelationName(rel));
-          ns_oid = RelationGetNamespace(rel);
-          relation_close(rel, NoLock);
-        }
-        if (rel_name) {
-          schema_name = get_namespace_name(ns_oid);
-          entity_id = schema_name ? psprintf("%s.%s", schema_name, rel_name) : pstrdup(rel_name);
-          pfree(rel_name);
+        {
+          Oid ns_oid = InvalidOid;
+          char *rel_name;
+          entity_type = "Table";
+          rel_name = get_rel_name(objectId);
+          if (rel_name) ns_oid = get_rel_namespace(objectId);
+          else {
+            Relation rel = relation_open(objectId, NoLock);
+            rel_name = pstrdup(RelationGetRelationName(rel));
+            ns_oid = RelationGetNamespace(rel);
+            relation_close(rel, NoLock);
+          }
+          if (rel_name) {
+            schema_name = get_namespace_name(ns_oid);
+            entity_id = schema_name ? psprintf("%s.%s", schema_name, rel_name) : pstrdup(rel_name);
+            pfree(rel_name);
+          }
         }
       }
       break;
@@ -1177,9 +1233,9 @@ void _PG_fini(void) {
 Datum pg_authorization_is_enabled(PG_FUNCTION_ARGS) { PG_RETURN_BOOL(cedar_authorization_enabled); }
 
 Datum pg_authorization_stats(PG_FUNCTION_ARGS) {
-  TupleDesc tupdesc = CreateTemplateTupleDesc(8);
-  Datum values[8];
-  bool nulls[8] = {false};
+  TupleDesc tupdesc = CreateTemplateTupleDesc(10);
+  Datum values[10];
+  bool nulls[10] = {false};
   TupleDescInitEntry(tupdesc, 1, "auth_requests", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 2, "auth_grants", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 3, "auth_denies", INT8OID, -1, 0);
@@ -1188,6 +1244,8 @@ Datum pg_authorization_stats(PG_FUNCTION_ARGS) {
   TupleDescInitEntry(tupdesc, 6, "sync_requests", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 7, "sync_successes", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 8, "sync_failures", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 9, "avg_total_time_ms", FLOAT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 10, "avg_remote_time_ms", FLOAT8OID, -1, 0);
   tupdesc = BlessTupleDesc(tupdesc);
   values[0] = Int64GetDatum(stats_auth_requests);
   values[1] = Int64GetDatum(stats_auth_grants);
@@ -1197,11 +1255,21 @@ Datum pg_authorization_stats(PG_FUNCTION_ARGS) {
   values[5] = Int64GetDatum(stats_sync_requests);
   values[6] = Int64GetDatum(stats_sync_successes);
   values[7] = Int64GetDatum(stats_sync_failures);
+  
+  if (stats_auth_requests > 0) {
+    values[8] = Float8GetDatum((stats_auth_total_time * 1000.0) / stats_auth_requests);
+    values[9] = Float8GetDatum((stats_auth_remote_time * 1000.0) / stats_auth_requests);
+  } else {
+    values[8] = Float8GetDatum(0.0);
+    values[9] = Float8GetDatum(0.0);
+  }
+  
   PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
 Datum pg_authorization_reset_stats(PG_FUNCTION_ARGS) {
   stats_auth_requests = stats_auth_grants = stats_auth_denies = stats_auth_ignores = stats_auth_errors = 0;
+  stats_auth_total_time = stats_auth_remote_time = 0;
   stats_sync_requests = stats_sync_successes = stats_sync_failures = 0;
   PG_RETURN_VOID();
 }
@@ -1233,5 +1301,10 @@ Datum pg_authorization_cache_stats(PG_FUNCTION_ARGS) {
 Datum pg_authorization_cache_reset(PG_FUNCTION_ARGS) {
   reset_auth_cache();
   stats_cache_hits = stats_cache_misses = stats_cache_evictions = 0;
+  PG_RETURN_VOID();
+}
+
+Datum pg_authorization_flush_syscache(PG_FUNCTION_ARGS) {
+  InvalidateSystemCaches();
   PG_RETURN_VOID();
 }

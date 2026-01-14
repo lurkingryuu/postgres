@@ -21,7 +21,9 @@ CREATE FUNCTION pg_authorization_stats(
     OUT auth_errors bigint,
     OUT sync_requests bigint,
     OUT sync_successes bigint,
-    OUT sync_failures bigint
+    OUT sync_failures bigint,
+    OUT avg_total_time_ms double precision,
+    OUT avg_remote_time_ms double precision
 )
 RETURNS record
 AS 'MODULE_PATHNAME', 'pg_authorization_stats'
@@ -71,6 +73,15 @@ LANGUAGE C STRICT VOLATILE;
 
 COMMENT ON FUNCTION pg_authorization_cache_reset() IS
 'Resets the authorization cache';
+
+-- Function to flush system caches
+CREATE FUNCTION pg_authorization_flush_syscache()
+RETURNS void
+AS 'MODULE_PATHNAME', 'pg_authorization_flush_syscache'
+LANGUAGE C STRICT VOLATILE;
+
+COMMENT ON FUNCTION pg_authorization_flush_syscache() IS
+'Flushes all PostgreSQL system caches (catalog cache, relcache, etc.)';
 
 -- View for easy access to statistics
 CREATE VIEW pg_authorization_statistics AS

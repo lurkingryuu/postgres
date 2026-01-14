@@ -135,6 +135,9 @@ extern void InitAuthorizationInfo(AuthorizationInfo *info,
 								  AuthorizationEventType event_type,
 								  Oid roleid);
 
+/* Free resources in an AuthorizationInfo structure */
+extern void FreeAuthorizationInfo(AuthorizationInfo *info);
+
 /* Get human-readable names for enum values */
 extern const char *GetAuthorizationEventTypeName(AuthorizationEventType event_type);
 extern const char *GetAuthorizationResultName(AuthorizationResult result);
