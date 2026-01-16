@@ -92,6 +92,7 @@ static int cedar_request_timeout = 5000; /* Timeout in milliseconds */
 static bool cedar_authorization_enabled = true;
 static bool cedar_entity_sync_enabled = true;
 static bool cedar_log_decisions = false;
+static bool cedar_collect_stats = true;
 
 /* Caching GUCs */
 static bool cedar_cache_enabled = true;
@@ -422,7 +423,7 @@ static AuthorizationResult cedar_call_is_authorized_internal(const char *princip
     persistent_curl = curl_easy_init();
     if (!persistent_curl) {
       ereport(WARNING, (errmsg("pg_authorization: failed to initialize curl")));
-      stats->auth_errors++;
+      if (cedar_collect_stats) stats->auth_errors++;
       return PG_AUTH_RESULT_IGNORE;
     }
   } else {
@@ -495,7 +496,7 @@ static AuthorizationResult cedar_call_is_authorized_internal(const char *princip
   if (res != CURLE_OK) {
     ereport(LOG, (errmsg("pg_authorization: curl request failed: %s",
                              curl_easy_strerror(res))));
-    stats->auth_errors++;
+    if (cedar_collect_stats) stats->auth_errors++;
     result = PG_AUTH_RESULT_IGNORE;
   } else {
     double total_time;
@@ -507,25 +508,28 @@ static AuthorizationResult cedar_call_is_authorized_internal(const char *princip
     curl_easy_getinfo(persistent_curl, CURLINFO_STARTTRANSFER_TIME, &start_transfer_time);
     curl_easy_getinfo(persistent_curl, CURLINFO_PRETRANSFER_TIME, &pre_transfer_time);
 
-    stats->auth_total_time += total_time;
-    stats->auth_remote_time += (start_transfer_time - pre_transfer_time);
+    if (cedar_collect_stats)
+    {
+        stats->auth_total_time += total_time;
+        stats->auth_remote_time += (start_transfer_time - pre_transfer_time);
+    }
 
     appendStringInfoChar(&response_body, '\0');
 
     if (response_code == 200) {
       if (strstr(response_body.data, "\"Allow\"") != NULL) {
         result = PG_AUTH_RESULT_GRANT;
-        stats->auth_grants++;
+        if (cedar_collect_stats) stats->auth_grants++;
       } else if (strstr(response_body.data, "\"Deny\"") != NULL) {
         result = PG_AUTH_RESULT_DENY;
-        stats->auth_denies++;
+        if (cedar_collect_stats) stats->auth_denies++;
       } else {
         result = PG_AUTH_RESULT_IGNORE;
-        stats->auth_ignores++;
+        if (cedar_collect_stats) stats->auth_ignores++;
       }
     } else {
       ereport(WARNING, (errmsg("pg_authorization: Cedar Agent returned status %ld", response_code)));
-      stats->auth_errors++;
+      if (cedar_collect_stats) stats->auth_errors++;
       result = PG_AUTH_RESULT_IGNORE;
     }
   }
@@ -569,7 +573,7 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
       cedar_agent_url[0] == '\0')
     return false;
 
-  stats->sync_requests++;
+  if (cedar_collect_stats) stats->sync_requests++;
 
   if (persistent_curl == NULL) {
     persistent_curl = curl_easy_init();
@@ -630,17 +634,17 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
 
   if (res != CURLE_OK) {
     ereport(WARNING, (errmsg("pg_authorization: entity sync failed: %s", curl_easy_strerror(res))));
-    stats->sync_failures++;
+    if (cedar_collect_stats) stats->sync_failures++;
   } else {
     curl_easy_getinfo(persistent_curl, CURLINFO_RESPONSE_CODE, &response_code);
     if (response_code >= 200 && response_code < 300) {
-      stats->sync_successes++;
+      if (cedar_collect_stats) stats->sync_successes++;
       success = true;
     } else if (response_code == 409) {
-      stats->sync_successes++;
+      if (cedar_collect_stats) stats->sync_successes++;
       success = true;
     } else {
-      stats->sync_failures++;
+      if (cedar_collect_stats) stats->sync_failures++;
     }
   }
 
@@ -675,7 +679,7 @@ static bool cedar_sync_entity_delete(const char *entity_type,
       cedar_agent_url[0] == '\0')
     return false;
 
-  stats->sync_requests++;
+  if (cedar_collect_stats) stats->sync_requests++;
 
   if (persistent_curl == NULL) {
     persistent_curl = curl_easy_init();
@@ -727,17 +731,17 @@ static bool cedar_sync_entity_delete(const char *entity_type,
 
   if (res != CURLE_OK) {
     ereport(WARNING, (errmsg("pg_authorization: entity delete failed: %s", curl_easy_strerror(res))));
-    stats->sync_failures++;
+    if (cedar_collect_stats) stats->sync_failures++;
   } else {
     curl_easy_getinfo(persistent_curl, CURLINFO_RESPONSE_CODE, &response_code);
     if (response_code >= 200 && response_code < 300) {
-      stats->sync_successes++;
+      if (cedar_collect_stats) stats->sync_successes++;
       success = true;
     } else if (response_code == 404) {
-      stats->sync_successes++;
+      if (cedar_collect_stats) stats->sync_successes++;
       success = true;
     } else {
-      stats->sync_failures++;
+      if (cedar_collect_stats) stats->sync_failures++;
     }
   }
 
@@ -866,7 +870,7 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
           resource_id_str = psprintf("oid_%u", auth_info->info.ddl.objectid);
         have_resource_id = true;
 
-        stats->auth_requests++;
+        if (cedar_collect_stats) stats->auth_requests++;
         result = cedar_call_is_authorized_internal(
             "User", rolename,
             auth_info->info.ddl.command_tag,
@@ -1036,7 +1040,7 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
               {
                   const char *action = get_cedar_action_for_bit(bit);
                   if (action) {
-                      stats->auth_requests++;
+                      if (cedar_collect_stats) stats->auth_requests++;
                       result = cedar_call_is_authorized_internal(
                           "User", rolename,
                           action,
@@ -1232,7 +1236,7 @@ static AuthorizationResult check_auth_cache(Oid roleid, Oid classid, Oid resourc
   entry = (AuthCacheEntry *) hash_search(auth_cache, &key, HASH_FIND, NULL);
   if (entry != NULL) {
     if (now < entry->expires && entry->created_at >= stats->last_cache_reset) {
-      cache_stats->hits++;
+      if (cedar_collect_stats) cache_stats->hits++;
       result = entry->result;
     }
   }
@@ -1246,7 +1250,9 @@ static AuthorizationResult check_auth_cache(Oid roleid, Oid classid, Oid resourc
   }
 
   if (result == PG_AUTH_RESULT_IGNORE)
-    cache_stats->misses++;
+  {
+    if (cedar_collect_stats) cache_stats->misses++;
+  }
 
   return result;
 }
@@ -1277,7 +1283,7 @@ static void update_auth_cache(Oid roleid, Oid classid, Oid resource_oid,
     HASH_SEQ_STATUS status;
     AuthCacheEntry *iter_entry;
 
-    cache_stats->evictions++;
+    if (cedar_collect_stats) cache_stats->evictions++;
     
     /* Soft reset: invalidate all existing entries by updating the global timestamp */
     if (stats) stats->last_cache_reset = now;
@@ -1343,6 +1349,11 @@ void _PG_init(void) {
       "pg_authorization.log_decisions",
       "Log authorization decisions", NULL,
       &cedar_log_decisions, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+  DefineCustomBoolVariable(
+      "pg_authorization.collect_stats",
+      "Collect authorization statistics in shared memory", NULL,
+      &cedar_collect_stats, true, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
   /* Cache GUCs */
   DefineCustomBoolVariable(
