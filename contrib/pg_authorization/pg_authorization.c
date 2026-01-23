@@ -99,6 +99,12 @@ static bool cedar_cache_enabled = true;
 static int cedar_cache_size = 1024;
 static int cedar_cache_ttl = 300; /* seconds */
 
+/* HTTPS/SSL GUCs */
+static bool cedar_use_https = false;
+static bool cedar_ssl_verify_peer = false;
+static char *cedar_ssl_cert_file = NULL;
+static char *cedar_ssl_key_file = NULL;
+
 /* Cache structures */
 typedef struct AuthCacheKey {
   Oid roleid;
@@ -260,6 +266,7 @@ static AuthorizationResult check_auth_cache(Oid roleid, Oid classid, Oid resourc
                                            int32 subid, int32 action);
 static void update_auth_cache(Oid roleid, Oid classid, Oid resource_oid,
                              int32 subid, int32 action, AuthorizationResult result);
+static void configure_curl_ssl(CURL *curl_handle);
 
 /* --------------------------------------------------------------------------
  * Helper: JSON string escaping
@@ -402,6 +409,43 @@ pg_auth_curl_write_cb(void *contents, size_t size, size_t nmemb, void *userp)
 }
 
 /* --------------------------------------------------------------------------
+ * Helper: Configure SSL/TLS options for CURL handle
+ * --------------------------------------------------------------------------
+ */
+static void
+configure_curl_ssl(CURL *curl_handle)
+{
+  if (!cedar_use_https)
+    return;
+
+  /* Configure SSL/TLS certificate verification */
+  if (cedar_ssl_verify_peer)
+  {
+    curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 2L);
+  }
+  else
+  {
+    curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 0L);
+  }
+
+  /* Configure client certificate for mTLS if provided */
+  if (cedar_ssl_cert_file && cedar_ssl_cert_file[0] != '\0')
+  {
+    curl_easy_setopt(curl_handle, CURLOPT_SSLCERT, cedar_ssl_cert_file);
+    curl_easy_setopt(curl_handle, CURLOPT_SSLCERTTYPE, "PEM");
+  }
+
+  /* Configure client private key for mTLS if provided */
+  if (cedar_ssl_key_file && cedar_ssl_key_file[0] != '\0')
+  {
+    curl_easy_setopt(curl_handle, CURLOPT_SSLKEY, cedar_ssl_key_file);
+    curl_easy_setopt(curl_handle, CURLOPT_SSLKEYTYPE, "PEM");
+  }
+}
+
+/* --------------------------------------------------------------------------
  * Cedar Agent: Call /v1/is_authorized endpoint
  * --------------------------------------------------------------------------
  */
@@ -490,7 +534,9 @@ static AuthorizationResult cedar_call_is_authorized_internal(const char *princip
   headers = curl_slist_append(headers, "Content-Type: application/json");
   curl_easy_setopt(persistent_curl, CURLOPT_HTTPHEADER, headers);
 
-  /* Perform the request */
+  /* Configure SSL/TLS if HTTPS is enabled */
+  configure_curl_ssl(persistent_curl);
+
   res = curl_easy_perform(persistent_curl);
 
   if (res != CURLE_OK) {
@@ -726,6 +772,9 @@ static bool cedar_sync_entity_delete(const char *entity_type,
 
   headers = curl_slist_append(headers, "Content-Type: application/json");
   curl_easy_setopt(persistent_curl, CURLOPT_HTTPHEADER, headers);
+
+  /* Configure SSL/TLS if HTTPS is enabled */
+  configure_curl_ssl(persistent_curl);
 
   res = curl_easy_perform(persistent_curl);
 
@@ -1367,6 +1416,23 @@ void _PG_init(void) {
   DefineCustomIntVariable(
       "pg_authorization.cache_ttl", "TTL for cache entries in seconds", NULL,
       &cedar_cache_ttl, 300, 1, 86400, PGC_SIGHUP, GUC_UNIT_S, NULL, NULL, NULL);
+
+  /* HTTPS/SSL GUCs */
+  DefineCustomBoolVariable(
+      "pg_authorization.use_https", "Enable HTTPS for Cedar Agent communication", NULL,
+      &cedar_use_https, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+  DefineCustomBoolVariable(
+      "pg_authorization.ssl_verify_peer", "Enable SSL certificate verification", NULL,
+      &cedar_ssl_verify_peer, false, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+  DefineCustomStringVariable(
+      "pg_authorization.ssl_cert_file", "Path to client certificate file for mTLS", NULL,
+      &cedar_ssl_cert_file, "", PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+  DefineCustomStringVariable(
+      "pg_authorization.ssl_key_file", "Path to client private key file for mTLS", NULL,
+      &cedar_ssl_key_file, "", PGC_SIGHUP, 0, NULL, NULL, NULL);
 
   MarkGUCPrefixReserved("pg_authorization");
 

@@ -90,6 +90,27 @@ pg_authorization.log_decisions (boolean)
     Log authorization decisions and Cedar Agent requests.
     Default: false
 
+pg_authorization.use_https (boolean)
+    Enable HTTPS for Cedar Agent communication.
+    Default: false
+
+pg_authorization.ssl_verify_peer (boolean)
+    Enable SSL certificate verification when using HTTPS.
+    Set to true for production with valid certificates.
+    Set to false to allow self-signed certificates (useful for dev/testing).
+    Default: false
+
+pg_authorization.ssl_cert_file (string)
+    Path to client certificate file for mutual TLS (mTLS) authentication.
+    Example: '/path/to/client.crt'
+    Default: '' (no client certificate)
+
+pg_authorization.ssl_key_file (string)
+    Path to client private key file for mutual TLS (mTLS) authentication.
+    Example: '/path/to/client.key'
+    Default: '' (no client key)
+    Note: Ensure the key file is readable only by the postgres user.
+
 Usage Example
 -------------
 
@@ -111,6 +132,70 @@ SELECT * FROM pg_authorization_statistics;
 
 -- Reset statistics
 SELECT pg_authorization_reset_stats();
+
+HTTPS Configuration
+-------------------
+
+The extension supports HTTPS for secure communication with Cedar Agent.
+HTTPS is optional and disabled by default for backward compatibility.
+
+Basic HTTPS (self-signed certificates):
+
+  -- Enable HTTPS without certificate verification (useful for dev/testing)
+  ALTER SYSTEM SET pg_authorization.cedar_agent_url = 'https://localhost:8443';
+  ALTER SYSTEM SET pg_authorization.use_https = true;
+  SELECT pg_reload_conf();
+
+HTTPS with Certificate Verification (production):
+
+  -- Enable HTTPS with full certificate verification
+  ALTER SYSTEM SET pg_authorization.cedar_agent_url = 'https://cedar.example.com';
+  ALTER SYSTEM SET pg_authorization.use_https = true;
+  ALTER SYSTEM SET pg_authorization.ssl_verify_peer = true;
+  SELECT pg_reload_conf();
+
+  Note: The Cedar Agent must present a valid certificate signed by a trusted CA
+  when ssl_verify_peer is enabled. System CA certificates are used for validation.
+
+HTTPS with Mutual TLS (maximum security):
+
+  -- Enable HTTPS with mTLS for client authentication
+  ALTER SYSTEM SET pg_authorization.cedar_agent_url = 'https://cedar.example.com';
+  ALTER SYSTEM SET pg_authorization.use_https = true;
+  ALTER SYSTEM SET pg_authorization.ssl_verify_peer = true;
+  ALTER SYSTEM SET pg_authorization.ssl_cert_file = '/etc/postgres/certs/client.crt';
+  ALTER SYSTEM SET pg_authorization.ssl_key_file = '/etc/postgres/certs/client.key';
+  SELECT pg_reload_conf();
+
+  Security Notes:
+  - Ensure the private key file has restrictive permissions (0600)
+  - The key file should be readable only by the postgres user
+  - Both certificate and key files must be in PEM format
+
+Progressive Security Setup:
+
+  You can start with HTTP and progressively add security:
+  
+  1. Development: HTTP
+     cedar_agent_url = 'http://localhost:8180'
+     use_https = false (default)
+  
+  2. Testing with self-signed certs: HTTPS (unverified)
+     cedar_agent_url = 'https://localhost:8443'
+     use_https = true
+     ssl_verify_peer = false (default)
+  
+  3. Staging/Production: HTTPS (verified)
+     cedar_agent_url = 'https://cedar.example.com'
+     use_https = true
+     ssl_verify_peer = true
+  
+  4. High Security: HTTPS + mTLS
+     cedar_agent_url = 'https://cedar.example.com'
+     use_https = true
+     ssl_verify_peer = true
+     ssl_cert_file = '/path/to/client.crt'
+     ssl_key_file = '/path/to/client.key'
 
 -- Manually sync an entity
 SELECT pg_authorization_sync_entity('Table', 'public.mytable');
