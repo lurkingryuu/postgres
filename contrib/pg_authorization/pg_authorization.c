@@ -532,6 +532,7 @@ static AuthorizationResult cedar_call_is_authorized_internal(const char *princip
   curl_easy_setopt(persistent_curl, CURLOPT_TCP_KEEPALIVE, 1L);
 
   headers = curl_slist_append(headers, "Content-Type: application/json");
+  headers = curl_slist_append(headers, "X-Cedar-Write-Origin: db-entity-sync");
   curl_easy_setopt(persistent_curl, CURLOPT_HTTPHEADER, headers);
 
   /* Configure SSL/TLS if HTTPS is enabled */
@@ -674,6 +675,7 @@ static bool cedar_sync_entity_upsert(const char *entity_type,
   curl_easy_setopt(persistent_curl, CURLOPT_CONNECTTIMEOUT_MS, 1000);
 
   headers = curl_slist_append(headers, "Content-Type: application/json");
+  headers = curl_slist_append(headers, "X-Cedar-Write-Origin: db-entity-sync");
   curl_easy_setopt(persistent_curl, CURLOPT_HTTPHEADER, headers);
 
   res = curl_easy_perform(persistent_curl);
