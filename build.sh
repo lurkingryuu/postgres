@@ -15,8 +15,8 @@ set -euo pipefail
 # Port for this instance
 : "${PGPORT:=55432}"
 
-# Cedar Agent base URL (must match your deployment)
-: "${CEDAR_URL:=http://localhost:8280}"
+# (Optional) Cedar Agent base URL (if future external integration is needed)
+# : "${CEDAR_URL:=http://localhost:8280}"
 
 # Build directory (Meson)
 BUILD_DIR="${PG_SRC_DIR}/builddir"
@@ -64,7 +64,7 @@ usage() {
   cat <<EOF
 Usage: $0 [up|down]
 
-  up   : Build, install, configure, and start PostgreSQL with pg_authorization (default)
+  up   : Build, install, configure, and start PostgreSQL with pg_cedar (default)
   down : Stop PostgreSQL (if running) and remove PGDATA for a clean slate
 
 Environment overrides:
@@ -72,7 +72,6 @@ Environment overrides:
   PG_PREFIX    : Install prefix (default: ${PG_PREFIX})
   PGDATA       : Data directory (default: ${PGDATA})
   PGPORT       : Port (default: ${PGPORT})
-  CEDAR_URL    : Cedar Agent base URL (default: ${CEDAR_URL})
 EOF
 }
 
@@ -105,7 +104,6 @@ log "Using PG_SRC_DIR=${PG_SRC_DIR}"
 log "Using PG_PREFIX=${PG_PREFIX}"
 log "Using PGDATA=${PGDATA}"
 log "Using PGPORT=${PGPORT}"
-log "Using CEDAR_URL=${CEDAR_URL}"
 
 ### 2. Configure with Meson
 
@@ -124,14 +122,14 @@ else
   cd "${PG_SRC_DIR}"
 fi
 
-### 3. Build PostgreSQL and contrib/pg_authorization
+### 3. Build PostgreSQL and contrib/pg_cedar
 
 cd "${BUILD_DIR}"
-log "Building PostgreSQL and contrib/pg_authorization..."
+log "Building PostgreSQL and contrib/pg_cedar..."
 ninja
 
 # If you want to rebuild just the extension on later runs:
-# ninja contrib/pg_authorization/pg_authorization.so
+# ninja contrib/pg_cedar/pg_cedar.so
 
 ### 4. Install binaries and extension
 
@@ -161,11 +159,11 @@ else
   log "Existing data directory found at ${PGDATA}"
 fi
 
-### 6. Configure postgresql.conf for pg_authorization + Cedar
+### 6. Configure postgresql.conf for pg_cedar + Cedar
 
 POSTGRESQL_CONF="${PGDATA}/postgresql.conf"
 
-log "Configuring ${POSTGRESQL_CONF} for pg_authorization and Cedar..."
+log "Configuring ${POSTGRESQL_CONF} for pg_cedar and Cedar..."
 
 # Ensure basic settings are present or updated
 # We append only if no existing line matches the setting key
@@ -173,20 +171,14 @@ append_if_missing "${POSTGRESQL_CONF}" '^port[[:space:]]*=' \
   "port = ${PGPORT}"
 
 append_if_missing "${POSTGRESQL_CONF}" '^shared_preload_libraries[[:space:]]*=' \
-  "shared_preload_libraries = 'pg_authorization'"
+  "shared_preload_libraries = 'pg_cedar'"
 
-append_if_missing "${POSTGRESQL_CONF}" '^pg_authorization.cedar_url[[:space:]]*=' \
-  "pg_authorization.cedar_url = '${CEDAR_URL}'"
-
-append_if_missing "${POSTGRESQL_CONF}" '^pg_authorization.cedar_timeout[[:space:]]*=' \
-  "pg_authorization.cedar_timeout = 5000  # ms"
-
-append_if_missing "${POSTGRESQL_CONF}" '^pg_authorization.enabled[[:space:]]*=' \
-  "pg_authorization.enabled = on"
+append_if_missing "${POSTGRESQL_CONF}" '^pg_cedar.enabled[[:space:]]*=' \
+  "pg_cedar.enabled = on"
 
 # Optional: if you added a log level GUC in your extension, uncomment / adjust:
-# append_if_missing "${POSTGRESQL_CONF}" '^pg_authorization.log_level[[:space:]]*=' \
-#   "pg_authorization.log_level = 'info'"
+# append_if_missing "${POSTGRESQL_CONF}" '^pg_cedar.log_decisions[[:space:]]*=' \
+#   "pg_cedar.log_decisions = on"
 
 ### 7. Start (or restart) PostgreSQL
 
@@ -199,37 +191,36 @@ pg_ctl -D "${PGDATA}" -l "${PGDATA}/logfile" -w restart || {
 
 log "PostgreSQL is running."
 
-### 8. Create pg_authorization extension in target database
+### 8. Create pg_cedar extension in target database
 
 TARGET_DB="postgres"   # change if you want a different DB
 
-log "Creating extension pg_authorization in database ${TARGET_DB} (if not present)..."
+log "Creating extension pg_cedar in database ${TARGET_DB} (if not present)..."
 
 # CREATE EXTENSION IF NOT EXISTS is available in modern PostgreSQL
 psql -d "${TARGET_DB}" -v ON_ERROR_STOP=1 <<'SQL'
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_extension WHERE extname = 'pg_authorization'
+        SELECT 1 FROM pg_extension WHERE extname = 'pg_cedar'
     ) THEN
-        EXECUTE 'CREATE EXTENSION pg_authorization';
+        EXECUTE 'CREATE EXTENSION pg_cedar';
     END IF;
 END;
 $$ LANGUAGE plpgsql;
 SQL
 
-log "Extension pg_authorization is installed."
+log "Extension pg_cedar is installed."
 
 ### 9. Quick verification
 
 log "Verifying shared_preload_libraries..."
 psql -d "${TARGET_DB}" -c "SHOW shared_preload_libraries;" || true
 
-log "Checking pg_authorization_is_enabled()..."
-psql -d "${TARGET_DB}" -c "SELECT pg_authorization_is_enabled();" || true
+log "Checking cedar_is_enabled()..."
+psql -d "${TARGET_DB}" -c "SELECT cedar_is_enabled();" || true
 
 log "Setup complete."
 log "You can now connect with: PGPORT=${PGPORT} psql -d ${TARGET_DB}"
 log "PostgreSQL prefix: ${PG_PREFIX}"
 log "Data directory:    ${PGDATA}"
-log "Cedar URL:         ${CEDAR_URL}"

@@ -15,7 +15,7 @@ if libcedar_dir == ''
   # Try a few common locations
   candidate_dirs = [
     meson.current_source_dir() / 'libcedar',
-    meson.project_source_root() / '..' / 'libcedar',
+    meson.source_root() / '..' / 'libcedar',
   ]
   foreach d : candidate_dirs
     if fs.is_file(d / 'include' / 'libcedar.h')
@@ -30,7 +30,11 @@ if libcedar_dir == ''
   subdir_done()
 endif
 
-libcedar_inc = include_directories(libcedar_dir / 'include')
+if libcedar_dir == meson.current_source_dir() / 'libcedar'
+  libcedar_inc = include_directories('libcedar/include')
+else
+  libcedar_inc = include_directories(libcedar_dir / 'include')
+endif
 
 # Declare the static library as an external dependency
 libcedar_lib = declare_dependency(
