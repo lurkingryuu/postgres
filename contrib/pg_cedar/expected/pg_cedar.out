@@ -1,0 +1,97 @@
+/* Test the pg_cedar extension */
+CREATE EXTENSION pg_cedar;
+-- Check if enabled (should be true by default)
+SELECT cedar_is_enabled();
+ cedar_is_enabled 
+------------------
+ t
+(1 row)
+
+-- Load a simple policy via cedar_set_policies
+SELECT cedar_set_policies('test_policy',
+    'permit(principal == User::"alice", action == Action::"SELECT", resource == Table::"public.test");');
+ cedar_set_policies 
+--------------------
+ t
+(1 row)
+
+-- Test manual authorization: alice should be allowed
+SELECT cedar_is_authorized(
+    'User::"alice"',
+    'Action::"SELECT"',
+    'Table::"public.test"',
+    NULL
+);
+ cedar_is_authorized 
+---------------------
+ Allow
+(1 row)
+
+-- Test manual authorization: bob should be denied
+SELECT cedar_is_authorized(
+    'User::"bob"',
+    'Action::"SELECT"',
+    'Table::"public.test"',
+    NULL
+);
+ cedar_is_authorized 
+---------------------
+ Deny
+(1 row)
+
+-- Validate policies (no schema loaded, should return OK)
+SELECT cedar_validate();
+ cedar_validate 
+----------------
+ OK
+(1 row)
+
+-- Get diagnostics for alice's decision
+SELECT cedar_explain_decision(
+    'User::"alice"',
+    'Action::"SELECT"',
+    'Table::"public.test"',
+    NULL
+);
+                cedar_explain_decision                 
+-------------------------------------------------------
+ {"reasons":["policy0"],"errors":[]}
+(1 row)
+
+-- Check statistics
+SELECT * FROM cedar_statistics;
+ auth_requests | auth_grants | auth_denies | auth_ignores | auth_errors | eval_time_us 
+---------------+-------------+-------------+--------------+-------------+--------------
+             0 |           0 |           0 |            0 |           0 |            0
+(1 row)
+
+-- Check cache stats
+SELECT (cedar_cache_stats()).hits >= 0 AS cache_ok;
+ cache_ok 
+----------
+ t
+(1 row)
+
+-- Reset stats
+SELECT cedar_reset_stats();
+ cedar_reset_stats 
+-------------------
+ 
+(1 row)
+
+-- Check configuration view
+SELECT * FROM cedar_config;
+ enabled | cedar_namespace | log_decisions | audit_enabled | cache_enabled | cache_size | cache_ttl 
+---------+-----------------+---------------+---------------+---------------+------------+-----------
+ on      |                 | off           | off           | on            | 1024       | 5min
+(1 row)
+
+-- Reload engine
+SELECT cedar_reload();
+ cedar_reload 
+--------------
+ t
+(1 row)
+
+-- Clean up
+DROP EXTENSION pg_cedar;

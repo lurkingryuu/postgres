@@ -1,0 +1,6 @@
+# pg_cedar extension
+comment = 'Embedded Cedar authorization engine for PostgreSQL'
+default_version = '1.0'
+module_pathname = '$libdir/pg_cedar'
+relocatable = false
+trusted = false
