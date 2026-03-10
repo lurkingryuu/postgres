@@ -27,7 +27,7 @@ PG_CPPFLAGS = -I$(LIBCEDAR_DIR)/include
 SHLIB_LINK  = $(LIBCEDAR_LIB) -lm -ldl -lpthread -lresolv
 
 EXTENSION = pg_cedar
-DATA = pg_cedar--1.0.sql
+DATA = pg_cedar--1.0.sql pg_cedar--1.0--1.1.sql pg_cedar--1.1.sql
 PGFILEDESC = "pg_cedar - embedded Cedar authorization engine for PostgreSQL"
 
 REGRESS = pg_cedar

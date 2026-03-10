@@ -79,6 +79,7 @@ PG_FUNCTION_INFO_V1(pg_cedar_stats);
 PG_FUNCTION_INFO_V1(pg_cedar_reset_stats);
 PG_FUNCTION_INFO_V1(pg_cedar_cache_stats);
 PG_FUNCTION_INFO_V1(pg_cedar_cache_reset);
+PG_FUNCTION_INFO_V1(pg_cedar_validate_text);
 
 /* --------------------------------------------------------------------------
  * GUC variables
@@ -1427,4 +1428,72 @@ Datum pg_cedar_cache_reset(PG_FUNCTION_ARGS) {
     cache_stats->evictions = 0;
   }
   PG_RETURN_VOID();
+}
+
+/*
+ * cedar_validate_text(policy_text text, schema_json text DEFAULT NULL) → text
+ *
+ * Validate a Cedar policy text against an optional schema using a throw-away
+ * engine instance.  Never touches the live per-backend engine, so it is safe
+ * to call for staged (not-yet-active) policies.
+ *
+ * Returns 'OK' on success, or an error message.
+ */
+Datum pg_cedar_validate_text(PG_FUNCTION_ARGS) {
+  char *policy_text;
+  char *schema_json = NULL;
+  struct CedarEngine *tmp_engine;
+  int rc;
+  const char *err;
+  text *result;
+
+  policy_text = text_to_cstring(PG_GETARG_TEXT_PP(0));
+  if (!PG_ARGISNULL(1))
+    schema_json = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+  tmp_engine = cedar_engine_new();
+  if (!tmp_engine) {
+    pfree(policy_text);
+    if (schema_json)
+      pfree(schema_json);
+    PG_RETURN_TEXT_P(cstring_to_text("Error: could not create validation engine"));
+  }
+
+  rc = cedar_engine_set_policies(tmp_engine, policy_text);
+  if (rc < 0) {
+    err = cedar_engine_last_error(tmp_engine);
+    result = cstring_to_text(err ? err : "policy parse error");
+    cedar_engine_free(tmp_engine);
+    pfree(policy_text);
+    if (schema_json)
+      pfree(schema_json);
+    PG_RETURN_TEXT_P(result);
+  }
+
+  if (schema_json) {
+    rc = cedar_engine_set_schema_json(tmp_engine, schema_json);
+    if (rc < 0) {
+      err = cedar_engine_last_error(tmp_engine);
+      result = cstring_to_text(err ? err : "schema parse error");
+      cedar_engine_free(tmp_engine);
+      pfree(policy_text);
+      pfree(schema_json);
+      PG_RETURN_TEXT_P(result);
+    }
+  }
+
+  rc = cedar_engine_validate(tmp_engine);
+  if (rc == 0) {
+    result = cstring_to_text("OK");
+  } else {
+    err = cedar_engine_last_error(tmp_engine);
+    result = cstring_to_text(err ? err : "validation failed");
+  }
+
+  cedar_engine_free(tmp_engine);
+  pfree(policy_text);
+  if (schema_json)
+    pfree(schema_json);
+
+  PG_RETURN_TEXT_P(result);
 }
