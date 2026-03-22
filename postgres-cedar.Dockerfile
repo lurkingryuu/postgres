@@ -8,6 +8,9 @@ FROM postgres:17.7 AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
     build-essential \
+    git \
+    curl \
+    ca-certificates \
     libreadline-dev \
     zlib1g-dev \
     flex \
@@ -36,6 +39,10 @@ WORKDIR /postgres-build
 
 # Copy the modified PostgreSQL source
 COPY . /postgres-build/
+
+# pg_cedar builds libcedar using Cargo; cedar-policy 4.9.0 requires rustc >= 1.89.
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.89.0
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Configure and build PostgreSQL
 # We use --with-uuid=e2fs which requires uuid-dev
