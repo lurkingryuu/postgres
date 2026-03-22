@@ -544,3 +544,18 @@ SELECT name, version, policy_hash, activated_by, activated_at, policy_text
 
 COMMENT ON VIEW cedar_active_policies IS
 'Currently active policysets only.';
+
+/* ========================================================================
+ * Catalog read grants
+ *
+ * Non-superuser backends must be able to read the Cedar catalog tables from
+ * inside the authorization hook (ensure_cedar_engine → SPI queries).  Without
+ * these grants, every non-superuser backend silently fails to load the Cedar
+ * engine, the hook returns IGNORE, and native ACL checks take over.
+ * ======================================================================== */
+
+GRANT SELECT ON cedar_policies        TO PUBLIC;
+GRANT SELECT ON cedar_schemas         TO PUBLIC;
+GRANT SELECT ON cedar_entities        TO PUBLIC;
+GRANT SELECT ON cedar_attributes      TO PUBLIC;
+GRANT SELECT ON cedar_principal_attrs TO PUBLIC;

@@ -418,3 +418,18 @@ SELECT name, version, policy_hash, activated_by, activated_at, policy_text
 
 COMMENT ON VIEW cedar_active_policies IS
 'Currently active policysets only.';
+
+/* ========================================================================
+ * Catalog read grants
+ *
+ * Backfill grants on base tables (in case the instance was installed at 1.0
+ * without them) and add grants for the new 1.1 tables.  Non-superuser backends
+ * need SELECT on all Cedar catalog tables so ensure_cedar_engine() can load
+ * the engine via SPI from inside the authorization hook.
+ * ======================================================================== */
+
+GRANT SELECT ON cedar_policies        TO PUBLIC;
+GRANT SELECT ON cedar_schemas         TO PUBLIC;
+GRANT SELECT ON cedar_entities        TO PUBLIC;
+GRANT SELECT ON cedar_attributes      TO PUBLIC;
+GRANT SELECT ON cedar_principal_attrs TO PUBLIC;

@@ -651,8 +651,18 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
   if (superuser_arg(auth_info->roleid))
     return PG_AUTH_RESULT_IGNORE;
 
-  /* Engine must be available */
-  if (!ensure_cedar_engine() || !cedar_engine_loaded)
+  /*
+   * Engine must be allocatable.  We deliberately do NOT gate on
+   * cedar_engine_loaded here: an empty Cedar policy set correctly returns
+   * Deny for every request (Cedar's default-deny semantics), which is the
+   * right fail-safe when the extension is enabled but policies have not been
+   * loaded yet.  Returning IGNORE instead would fall through to native ACL,
+   * defeating the purpose of the extension as the sole authorization gate.
+   *
+   * Superusers are already exempted above via superuser_arg(), so an empty
+   * policy set never blocks superuser setup operations.
+   */
+  if (!ensure_cedar_engine())
     return PG_AUTH_RESULT_IGNORE;
 
   if (cedar_collect_stats && stats)
