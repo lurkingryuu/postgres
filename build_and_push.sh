@@ -10,12 +10,28 @@ IMAGE_NAME="${IMAGE_NAME:-postgres-cedar}"
 TAG="${TAG:-latest}"
 FULL_IMAGE_NAME="${REGISTRY}/${IMAGE_NAME}:${TAG}"
 
+# Parse flags
+NATIVE_ONLY=false
+for arg in "$@"; do
+    case "$arg" in
+        --native) NATIVE_ONLY=true ;;
+        --multi-arch) NATIVE_ONLY=false ;;
+        --help|-h)
+            echo "Usage: $0 [--native | --multi-arch]"
+            echo "  --native      Build and push for this machine's architecture only (fast, ~2-5 min)"
+            echo "  --multi-arch  Build and push for linux/amd64 + linux/arm64 (default, ~20-30 min)"
+            exit 0
+            ;;
+    esac
+done
+
 echo "Building and pushing Cedar PostgreSQL Docker image"
 echo "=================================================="
 echo "Registry: ${REGISTRY}"
 echo "Image: ${IMAGE_NAME}"
 echo "Tag: ${TAG}"
 echo "Full image: ${FULL_IMAGE_NAME}"
+echo "Mode: $([ "$NATIVE_ONLY" = true ] && echo 'native (single-arch)' || echo 'multi-arch (amd64 + arm64)')"
 echo ""
 
 # Check if we're in the right directory
@@ -31,6 +47,8 @@ REQUIRED_FILES=(
     "postgres-init.sql"
     "contrib/pg_authorization/pg_authorization.control"
     "contrib/pg_authorization/pg_authorization--1.0.sql"
+    "contrib/pg_cedar/pg_cedar.control"
+    "contrib/pg_cedar/pg_cedar.c"
 )
 
 echo "Checking required files..."
@@ -48,19 +66,29 @@ echo ""
 echo "Setting up buildx for multi-platform builds..."
 docker buildx use multiarch-postgres || docker buildx create --name multiarch-postgres --use --bootstrap
 
-# Build and push multi-arch Docker image
-echo "Building and pushing multi-arch Docker image..."
-echo "Platforms: linux/amd64, linux/arm64"
-echo "Command: docker buildx build --platform linux/amd64,linux/arm64 --push -f postgres-cedar.Dockerfile -t ${FULL_IMAGE_NAME} ."
-echo "Note: This multi-arch build can take 20-30 minutes. It builds for both AMD64 and ARM64 architectures."
-echo "Tip: Using buildx for faster multi-platform builds with BuildKit."
-docker buildx build --platform linux/amd64,linux/arm64 --push -f postgres-cedar.Dockerfile -t "${FULL_IMAGE_NAME}" .
+# Build and push
+if [ "$NATIVE_ONLY" = true ]; then
+    NATIVE_PLATFORM="linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+    echo "Building and pushing native image..."
+    echo "Platform: ${NATIVE_PLATFORM}"
+    echo "Command: docker buildx build --platform ${NATIVE_PLATFORM} --push -f postgres-cedar.Dockerfile -t ${FULL_IMAGE_NAME} ."
+    docker buildx build --platform "${NATIVE_PLATFORM}" --push -f postgres-cedar.Dockerfile -t "${FULL_IMAGE_NAME}" .
+    BUILD_PLATFORMS="${NATIVE_PLATFORM}"
+else
+    echo "Building and pushing multi-arch Docker image..."
+    echo "Platforms: linux/amd64, linux/arm64"
+    echo "Command: docker buildx build --platform linux/amd64,linux/arm64 --push -f postgres-cedar.Dockerfile -t ${FULL_IMAGE_NAME} ."
+    echo "Note: This multi-arch build can take 20-30 minutes. It builds for both AMD64 and ARM64 architectures."
+    echo "Tip: Using buildx for faster multi-platform builds with BuildKit."
+    docker buildx build --platform linux/amd64,linux/arm64 --push -f postgres-cedar.Dockerfile -t "${FULL_IMAGE_NAME}" .
+    BUILD_PLATFORMS="linux/amd64, linux/arm64"
+fi
 
 if [ $? -eq 0 ]; then
-    echo "✓ Multi-arch Docker image built and pushed successfully: ${FULL_IMAGE_NAME}"
-    echo "  Platforms: linux/amd64, linux/arm64"
+    echo "✓ Docker image built and pushed successfully: ${FULL_IMAGE_NAME}"
+    echo "  Platforms: ${BUILD_PLATFORMS}"
 else
-    echo "✗ Multi-arch Docker build failed"
+    echo "✗ Docker build failed"
     echo ""
     echo "🔧 Troubleshooting:"
     echo "Run './troubleshoot_build.sh' for diagnostics"
@@ -84,8 +112,8 @@ fi
 # Note: Push is handled by buildx build --push above
 
 # Success message
-echo "🎉 Multi-arch build and push completed successfully!"
-echo "The image ${FULL_IMAGE_NAME} now supports both AMD64 and ARM64 architectures."
+echo "🎉 Build and push completed successfully!"
+echo "The image ${FULL_IMAGE_NAME} has been pushed (platforms: ${BUILD_PLATFORMS})."
 echo ""
 echo "Next steps:"
 echo "1. Set the environment variable in your experiments:"

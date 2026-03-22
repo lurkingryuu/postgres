@@ -85,10 +85,11 @@ RUN echo "/usr/local/pgsql/lib" > /etc/ld.so.conf.d/00-postgres-custom.conf && l
 # Also symlink our built PostgreSQL components to the official locations.
 # This ensures that the official image's entrypoint and scripts find our modified
 # versions instead of the standard ones.
-RUN mkdir -p /usr/lib/postgresql/17/lib/ && \
+RUN mkdir -p /usr/lib/postgresql/17/lib/ /usr/share/postgresql/17/extension/ && \
     ln -sf /usr/local/pgsql/lib/pg_authorization.so /usr/lib/postgresql/17/lib/pg_authorization.so && \
-    mkdir -p /usr/share/postgresql/17/extension/ && \
+    ln -sf /usr/local/pgsql/lib/pg_cedar.so      /usr/lib/postgresql/17/lib/pg_cedar.so && \
     ln -sf /usr/local/pgsql/share/extension/pg_authorization* /usr/share/postgresql/17/extension/ && \
+    ln -sf /usr/local/pgsql/share/extension/pg_cedar*         /usr/share/postgresql/17/extension/ && \
     ln -sf /usr/local/pgsql/bin/postgres /usr/lib/postgresql/17/bin/postgres && \
     ln -sf /usr/local/pgsql/bin/pg_config /usr/lib/postgresql/17/bin/pg_config
 
