@@ -66,6 +66,7 @@
 #include "utils/syscache.h"
 #include "utils/hsearch.h"
 #include "common/hashfn.h"
+#include "portability/instr_time.h"
 #include "utils/timestamp.h"
 #include "storage/ipc.h"
 #include "storage/shmem.h"
@@ -134,6 +135,10 @@ typedef struct pg_auth_stats_t
 	long auth_errors;
 	double auth_total_time;
 	double auth_remote_time;
+	long hook_calls;
+	double hook_total_time_us;
+	double cache_lookup_time_us;
+	double policy_eval_time_us;
 	long sync_requests;
 	long sync_successes;
 	long sync_failures;
@@ -454,6 +459,9 @@ static AuthorizationResult cedar_call_is_authorized_internal(const char *princip
                                                             const char *action,
                                                             const char *resource_type,
                                                             const char *resource_id) {
+  bool timing_enabled = (cedar_collect_stats && stats != NULL);
+  instr_time eval_start;
+  instr_time eval_end;
   CURLcode res;
   StringInfoData request_body;
   StringInfoData response_body;
@@ -461,6 +469,9 @@ static AuthorizationResult cedar_call_is_authorized_internal(const char *princip
   struct curl_slist *headers = NULL;
   long response_code;
   AuthorizationResult result = PG_AUTH_RESULT_IGNORE;
+
+  if (timing_enabled)
+    INSTR_TIME_SET_CURRENT(eval_start);
 
   /* Use persistent handle if possible */
   if (persistent_curl == NULL) {
@@ -585,6 +596,12 @@ static AuthorizationResult cedar_call_is_authorized_internal(const char *princip
   pfree(request_body.data);
   pfree(response_body.data);
   pfree(url.data);
+
+  if (timing_enabled) {
+    INSTR_TIME_SET_CURRENT(eval_end);
+    INSTR_TIME_SUBTRACT(eval_end, eval_start);
+    stats->policy_eval_time_us += INSTR_TIME_GET_MICROSEC(eval_end);
+  }
 
   return result;
 }
@@ -810,6 +827,9 @@ static bool cedar_sync_entity_delete(const char *entity_type,
  */
 static AuthorizationResult
 cedar_authorization_hook(AuthorizationInfo *auth_info) {
+  bool hook_timing_enabled = false;
+  instr_time hook_start;
+  instr_time hook_end;
   AuthorizationResult result = PG_AUTH_RESULT_GRANT;
   AclMode required_perms = 0;
   bool check_perms_loop = false;
@@ -842,6 +862,10 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
 
   if (cedar_agent_url == NULL || cedar_agent_url[0] == '\0')
     return PG_AUTH_RESULT_IGNORE;
+
+  hook_timing_enabled = (cedar_collect_stats && stats != NULL);
+  if (hook_timing_enabled)
+    INSTR_TIME_SET_CURRENT(hook_start);
 
   if (cedar_log_decisions) {
       if (rolename && rolename[0] != '\0')
@@ -1109,6 +1133,12 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
   }
 
 cleanup:
+  if (hook_timing_enabled) {
+    INSTR_TIME_SET_CURRENT(hook_end);
+    INSTR_TIME_SUBTRACT(hook_end, hook_start);
+    stats->hook_calls++;
+    stats->hook_total_time_us += INSTR_TIME_GET_MICROSEC(hook_end);
+  }
   if (have_resource_id && resource_id_str) pfree(resource_id_str);
   if (have_resolved_rolename && resolved_rolename) pfree(resolved_rolename);
   return result;
@@ -1269,10 +1299,16 @@ static void reset_auth_cache(void) {
 
 static AuthorizationResult check_auth_cache(Oid roleid, Oid classid, Oid resource_oid,
                                            int32 subid, int32 action) {
+  bool timing_enabled = (cedar_collect_stats && stats != NULL);
+  instr_time cache_start;
+  instr_time cache_end;
   AuthCacheKey key;
   AuthCacheEntry *entry;
   TimestampTz now = GetCurrentTimestamp();
   AuthorizationResult result = PG_AUTH_RESULT_IGNORE;
+
+  if (timing_enabled)
+    INSTR_TIME_SET_CURRENT(cache_start);
 
   if (!cedar_cache_enabled || auth_cache == NULL || auth_cache_lock == NULL || stats == NULL) return PG_AUTH_RESULT_IGNORE;
 
@@ -1303,6 +1339,12 @@ static AuthorizationResult check_auth_cache(Oid roleid, Oid classid, Oid resourc
   if (result == PG_AUTH_RESULT_IGNORE)
   {
     if (cedar_collect_stats) cache_stats->misses++;
+  }
+
+  if (timing_enabled) {
+    INSTR_TIME_SET_CURRENT(cache_end);
+    INSTR_TIME_SUBTRACT(cache_end, cache_start);
+    stats->cache_lookup_time_us += INSTR_TIME_GET_MICROSEC(cache_end);
   }
 
   return result;
@@ -1465,9 +1507,9 @@ void _PG_fini(void) {
 Datum pg_authorization_is_enabled(PG_FUNCTION_ARGS) { PG_RETURN_BOOL(cedar_authorization_enabled); }
 
 Datum pg_authorization_stats(PG_FUNCTION_ARGS) {
-  TupleDesc tupdesc = CreateTemplateTupleDesc(10);
-  Datum values[10];
-  bool nulls[10] = {false};
+  TupleDesc tupdesc = CreateTemplateTupleDesc(14);
+  Datum values[14];
+  bool nulls[14] = {false};
   TupleDescInitEntry(tupdesc, 1, "auth_requests", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 2, "auth_grants", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 3, "auth_denies", INT8OID, -1, 0);
@@ -1478,6 +1520,10 @@ Datum pg_authorization_stats(PG_FUNCTION_ARGS) {
   TupleDescInitEntry(tupdesc, 8, "sync_failures", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 9, "avg_total_time_ms", FLOAT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 10, "avg_remote_time_ms", FLOAT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 11, "hook_calls", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 12, "hook_total_time_us", FLOAT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 13, "cache_lookup_time_us", FLOAT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 14, "policy_eval_time_us", FLOAT8OID, -1, 0);
   tupdesc = BlessTupleDesc(tupdesc);
   values[0] = Int64GetDatum(stats->auth_requests);
   values[1] = Int64GetDatum(stats->auth_grants);
@@ -1495,6 +1541,10 @@ Datum pg_authorization_stats(PG_FUNCTION_ARGS) {
     values[8] = Float8GetDatum(0.0);
     values[9] = Float8GetDatum(0.0);
   }
+  values[10] = Int64GetDatum(stats->hook_calls);
+  values[11] = Float8GetDatum(stats->hook_total_time_us);
+  values[12] = Float8GetDatum(stats->cache_lookup_time_us);
+  values[13] = Float8GetDatum(stats->policy_eval_time_us);
   
   PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
@@ -1502,6 +1552,10 @@ Datum pg_authorization_stats(PG_FUNCTION_ARGS) {
 Datum pg_authorization_reset_stats(PG_FUNCTION_ARGS) {
   stats->auth_requests = stats->auth_grants = stats->auth_denies = stats->auth_ignores = stats->auth_errors = 0;
   stats->auth_total_time = stats->auth_remote_time = 0;
+  stats->hook_calls = 0;
+  stats->hook_total_time_us = 0;
+  stats->cache_lookup_time_us = 0;
+  stats->policy_eval_time_us = 0;
   stats->sync_requests = stats->sync_successes = stats->sync_failures = 0;
   PG_RETURN_VOID();
 }

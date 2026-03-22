@@ -420,6 +420,35 @@ COMMENT ON VIEW cedar_active_policies IS
 'Currently active policysets only.';
 
 /* ========================================================================
+ * Refresh statistics function/view signature (profiling fields)
+ * ======================================================================== */
+
+DROP VIEW IF EXISTS cedar_statistics;
+
+DROP FUNCTION IF EXISTS cedar_stats();
+CREATE FUNCTION cedar_stats(
+    OUT auth_requests  bigint,
+    OUT auth_grants    bigint,
+    OUT auth_denies    bigint,
+    OUT auth_ignores   bigint,
+    OUT auth_errors    bigint,
+    OUT eval_time_us   double precision,
+    OUT hook_calls     bigint,
+    OUT hook_total_time_us double precision,
+    OUT cache_lookup_time_us double precision,
+    OUT engine_ensure_time_us double precision
+)
+RETURNS record
+AS 'MODULE_PATHNAME', 'pg_cedar_stats'
+LANGUAGE C STRICT VOLATILE;
+
+CREATE VIEW cedar_statistics AS
+SELECT * FROM cedar_stats();
+
+COMMENT ON VIEW cedar_statistics IS
+'Current Cedar authorization statistics.';
+
+/* ========================================================================
  * Catalog read grants
  *
  * Backfill grants on base tables (in case the instance was installed at 1.0

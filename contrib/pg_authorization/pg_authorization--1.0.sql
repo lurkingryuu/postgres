@@ -23,7 +23,11 @@ CREATE FUNCTION pg_authorization_stats(
     OUT sync_successes bigint,
     OUT sync_failures bigint,
     OUT avg_total_time_ms double precision,
-    OUT avg_remote_time_ms double precision
+    OUT avg_remote_time_ms double precision,
+    OUT hook_calls bigint,
+    OUT hook_total_time_us double precision,
+    OUT cache_lookup_time_us double precision,
+    OUT policy_eval_time_us double precision
 )
 RETURNS record
 AS 'MODULE_PATHNAME', 'pg_authorization_stats'

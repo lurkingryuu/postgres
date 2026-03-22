@@ -187,7 +187,11 @@ CREATE FUNCTION cedar_stats(
     OUT auth_denies    bigint,
     OUT auth_ignores   bigint,
     OUT auth_errors    bigint,
-    OUT eval_time_us   double precision
+    OUT eval_time_us   double precision,
+    OUT hook_calls     bigint,
+    OUT hook_total_time_us double precision,
+    OUT cache_lookup_time_us double precision,
+    OUT engine_ensure_time_us double precision
 )
 RETURNS record
 AS 'MODULE_PATHNAME', 'pg_cedar_stats'

@@ -59,6 +59,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
+#include "portability/instr_time.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -126,7 +127,11 @@ typedef struct pg_cedar_stats_t {
   long auth_denies;
   long auth_ignores;
   long auth_errors;
+  long hook_calls;
   double eval_total_us;
+  double hook_total_time_us;
+  double cache_lookup_time_us;
+  double engine_ensure_time_us;
   TimestampTz last_cache_reset;
 } pg_cedar_stats_t;
 
@@ -355,6 +360,13 @@ static char *json_escape_string(const char *str) {
 
 /* Ensure the per-backend CedarEngine is initialized and loaded */
 static bool ensure_cedar_engine(void) {
+  bool timing_enabled = (cedar_collect_stats && stats != NULL);
+  instr_time ensure_start;
+  instr_time ensure_end;
+
+  if (timing_enabled)
+    INSTR_TIME_SET_CURRENT(ensure_start);
+
   if (cedar_engine == NULL) {
     cedar_engine = cedar_engine_new();
     if (cedar_engine == NULL) {
@@ -405,6 +417,12 @@ static bool ensure_cedar_engine(void) {
 
     cedar_engine_loaded =
         loaded_any || (cedar_default_policy && cedar_default_policy[0] != '\0');
+  }
+
+  if (timing_enabled) {
+    INSTR_TIME_SET_CURRENT(ensure_end);
+    INSTR_TIME_SUBTRACT(ensure_end, ensure_start);
+    stats->engine_ensure_time_us += INSTR_TIME_GET_MICROSEC(ensure_end);
   }
 
   return (cedar_engine != NULL);
@@ -534,6 +552,9 @@ static AuthorizationResult cedar_evaluate(const char *principal_type,
                                           const char *action,
                                           const char *resource_type,
                                           const char *resource_id) {
+  bool timing_enabled = (cedar_collect_stats && stats != NULL);
+  instr_time eval_start;
+  instr_time eval_end;
   StringInfoData principal_buf;
   StringInfoData action_buf;
   StringInfoData resource_buf;
@@ -542,6 +563,9 @@ static AuthorizationResult cedar_evaluate(const char *principal_type,
   AuthorizationResult result;
   char *escaped_principal;
   char *escaped_resource;
+
+  if (timing_enabled)
+    INSTR_TIME_SET_CURRENT(eval_start);
 
   if (!ensure_cedar_engine())
     return PG_AUTH_RESULT_IGNORE;
@@ -616,6 +640,12 @@ static AuthorizationResult cedar_evaluate(const char *principal_type,
   pfree(resource_buf.data);
   pfree(context_buf.data);
 
+  if (timing_enabled) {
+    INSTR_TIME_SET_CURRENT(eval_end);
+    INSTR_TIME_SUBTRACT(eval_end, eval_start);
+    stats->eval_total_us += INSTR_TIME_GET_MICROSEC(eval_end);
+  }
+
   return result;
 }
 
@@ -625,6 +655,9 @@ static AuthorizationResult cedar_evaluate(const char *principal_type,
  */
 static AuthorizationResult
 cedar_authorization_hook(AuthorizationInfo *auth_info) {
+  bool hook_timing_enabled = false;
+  instr_time hook_start;
+  instr_time hook_end;
   AuthorizationResult result = PG_AUTH_RESULT_GRANT;
   AclMode required_perms = 0;
   bool check_perms_loop = false;
@@ -651,6 +684,10 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
   if (superuser_arg(auth_info->roleid))
     return PG_AUTH_RESULT_IGNORE;
 
+  hook_timing_enabled = (cedar_collect_stats && stats != NULL);
+  if (hook_timing_enabled)
+    INSTR_TIME_SET_CURRENT(hook_start);
+
   /*
    * Engine must be allocatable.  We deliberately do NOT gate on
    * cedar_engine_loaded here: an empty Cedar policy set correctly returns
@@ -662,8 +699,10 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
    * Superusers are already exempted above via superuser_arg(), so an empty
    * policy set never blocks superuser setup operations.
    */
-  if (!ensure_cedar_engine())
-    return PG_AUTH_RESULT_IGNORE;
+  if (!ensure_cedar_engine()) {
+    result = PG_AUTH_RESULT_IGNORE;
+    goto cleanup;
+  }
 
   if (cedar_collect_stats && stats)
     stats->auth_requests++;
@@ -908,6 +947,12 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
   }
 
 cleanup:
+  if (hook_timing_enabled) {
+    INSTR_TIME_SET_CURRENT(hook_end);
+    INSTR_TIME_SUBTRACT(hook_end, hook_start);
+    stats->hook_calls++;
+    stats->hook_total_time_us += INSTR_TIME_GET_MICROSEC(hook_end);
+  }
   if (have_resource_id && resource_id_str)
     pfree(resource_id_str);
   if (have_resolved_rolename && resolved_rolename)
@@ -957,6 +1002,9 @@ static void reset_auth_cache(void) {
 static AuthorizationResult check_auth_cache(Oid roleid, Oid classid,
                                             Oid resource_oid, int32 subid,
                                             int32 action) {
+  bool timing_enabled = (cedar_collect_stats && stats != NULL);
+  instr_time cache_start;
+  instr_time cache_end;
   AuthCacheKey key;
   AuthCacheEntry *entry;
   TimestampTz now;
@@ -964,6 +1012,9 @@ static AuthorizationResult check_auth_cache(Oid roleid, Oid classid,
 
   if (!cedar_cache_enabled || !auth_cache || !auth_cache_lock || !stats)
     return PG_AUTH_RESULT_IGNORE;
+
+  if (timing_enabled)
+    INSTR_TIME_SET_CURRENT(cache_start);
 
   now = GetCurrentTimestamp();
 
@@ -995,6 +1046,12 @@ static AuthorizationResult check_auth_cache(Oid roleid, Oid classid,
 
   if (result == PG_AUTH_RESULT_IGNORE && cedar_collect_stats)
     cache_stats->misses++;
+
+  if (timing_enabled) {
+    INSTR_TIME_SET_CURRENT(cache_end);
+    INSTR_TIME_SUBTRACT(cache_end, cache_start);
+    stats->cache_lookup_time_us += INSTR_TIME_GET_MICROSEC(cache_end);
+  }
 
   return result;
 }
@@ -1367,16 +1424,20 @@ Datum pg_cedar_reload(PG_FUNCTION_ARGS) {
 
 Datum pg_cedar_stats(PG_FUNCTION_ARGS) {
   TupleDesc tupdesc;
-  Datum values[6];
-  bool nulls[6] = {false};
+  Datum values[10];
+  bool nulls[10] = {false};
 
-  tupdesc = CreateTemplateTupleDesc(6);
+  tupdesc = CreateTemplateTupleDesc(10);
   TupleDescInitEntry(tupdesc, 1, "auth_requests", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 2, "auth_grants", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 3, "auth_denies", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 4, "auth_ignores", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 5, "auth_errors", INT8OID, -1, 0);
   TupleDescInitEntry(tupdesc, 6, "eval_time_us", FLOAT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 7, "hook_calls", INT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 8, "hook_total_time_us", FLOAT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 9, "cache_lookup_time_us", FLOAT8OID, -1, 0);
+  TupleDescInitEntry(tupdesc, 10, "engine_ensure_time_us", FLOAT8OID, -1, 0);
   tupdesc = BlessTupleDesc(tupdesc);
 
   if (stats) {
@@ -1386,6 +1447,10 @@ Datum pg_cedar_stats(PG_FUNCTION_ARGS) {
     values[3] = Int64GetDatum(stats->auth_ignores);
     values[4] = Int64GetDatum(stats->auth_errors);
     values[5] = Float8GetDatum(stats->eval_total_us);
+    values[6] = Int64GetDatum(stats->hook_calls);
+    values[7] = Float8GetDatum(stats->hook_total_time_us);
+    values[8] = Float8GetDatum(stats->cache_lookup_time_us);
+    values[9] = Float8GetDatum(stats->engine_ensure_time_us);
   } else {
     values[0] = Int64GetDatum(0);
     values[1] = Int64GetDatum(0);
@@ -1393,6 +1458,10 @@ Datum pg_cedar_stats(PG_FUNCTION_ARGS) {
     values[3] = Int64GetDatum(0);
     values[4] = Int64GetDatum(0);
     values[5] = Float8GetDatum(0.0);
+    values[6] = Int64GetDatum(0);
+    values[7] = Float8GetDatum(0.0);
+    values[8] = Float8GetDatum(0.0);
+    values[9] = Float8GetDatum(0.0);
   }
 
   PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
@@ -1405,7 +1474,11 @@ Datum pg_cedar_reset_stats(PG_FUNCTION_ARGS) {
     stats->auth_denies = 0;
     stats->auth_ignores = 0;
     stats->auth_errors = 0;
+    stats->hook_calls = 0;
     stats->eval_total_us = 0;
+    stats->hook_total_time_us = 0;
+    stats->cache_lookup_time_us = 0;
+    stats->engine_ensure_time_us = 0;
   }
   PG_RETURN_VOID();
 }
