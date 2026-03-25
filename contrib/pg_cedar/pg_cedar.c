@@ -150,6 +150,14 @@ static pg_cedar_cache_stats_t *cache_stats = NULL;
  */
 static struct CedarEngine *cedar_engine = NULL;
 static bool cedar_engine_loaded = false;
+/*
+ * Fast-path flag: true iff cedar_engine != NULL && cedar_engine_loaded.
+ * Checked inline in the hot authorization path so that ensure_cedar_engine()
+ * is never called (saving the function-call + branch overhead) once the
+ * engine is fully initialized.  Must be cleared whenever either underlying
+ * variable is reset to a non-ready state.
+ */
+static bool cedar_engine_ready = false;
 static HTAB *auth_cache = NULL;
 static LWLock *auth_cache_lock = NULL;
 
@@ -371,9 +379,11 @@ static bool ensure_cedar_engine(void) {
     cedar_engine = cedar_engine_new();
     if (cedar_engine == NULL) {
       ereport(WARNING, (errmsg("pg_cedar: failed to create Cedar engine")));
+      cedar_engine_ready = false;
       return false;
     }
     cedar_engine_loaded = false;
+    cedar_engine_ready = false;
   }
 
   if (!cedar_engine_loaded) {
@@ -425,6 +435,7 @@ static bool ensure_cedar_engine(void) {
     stats->engine_ensure_time_us += INSTR_TIME_GET_MICROSEC(ensure_end);
   }
 
+  cedar_engine_ready = (cedar_engine != NULL && cedar_engine_loaded);
   return (cedar_engine != NULL);
 }
 
@@ -567,8 +578,9 @@ static AuthorizationResult cedar_evaluate(const char *principal_type,
   if (timing_enabled)
     INSTR_TIME_SET_CURRENT(eval_start);
 
-  if (!ensure_cedar_engine())
-    return PG_AUTH_RESULT_IGNORE;
+  if (unlikely(!cedar_engine_ready))
+    if (!ensure_cedar_engine())
+      return PG_AUTH_RESULT_IGNORE;
 
   escaped_principal = json_escape_string(principal_id);
   escaped_resource = json_escape_string(resource_id);
@@ -689,19 +701,27 @@ cedar_authorization_hook(AuthorizationInfo *auth_info) {
     INSTR_TIME_SET_CURRENT(hook_start);
 
   /*
-   * Engine must be allocatable.  We deliberately do NOT gate on
-   * cedar_engine_loaded here: an empty Cedar policy set correctly returns
-   * Deny for every request (Cedar's default-deny semantics), which is the
-   * right fail-safe when the extension is enabled but policies have not been
-   * loaded yet.  Returning IGNORE instead would fall through to native ACL,
-   * defeating the purpose of the extension as the sole authorization gate.
+   * Fast-path: skip ensure_cedar_engine() entirely when the engine is already
+   * initialized and loaded (the common steady-state case).  The flag is
+   * cleared whenever the engine is freed or needs reloading, so the slow-path
+   * is taken exactly when real work needs to be done.
+   *
+   * We deliberately do NOT gate on cedar_engine_loaded in the fast-path
+   * decision (cedar_engine_ready encapsulates both conditions): an empty Cedar
+   * policy set correctly returns Deny for every request (Cedar's default-deny
+   * semantics), which is the right fail-safe when the extension is enabled but
+   * policies have not been loaded yet.  Returning IGNORE instead would fall
+   * through to native ACL, defeating the purpose of the extension as the sole
+   * authorization gate.
    *
    * Superusers are already exempted above via superuser_arg(), so an empty
    * policy set never blocks superuser setup operations.
    */
-  if (!ensure_cedar_engine()) {
-    result = PG_AUTH_RESULT_IGNORE;
-    goto cleanup;
+  if (unlikely(!cedar_engine_ready)) {
+    if (!ensure_cedar_engine()) {
+      result = PG_AUTH_RESULT_IGNORE;
+      goto cleanup;
+    }
   }
 
   if (cedar_collect_stats && stats)
@@ -1173,6 +1193,7 @@ void _PG_init(void) {
 }
 
 void _PG_fini(void) {
+  cedar_engine_ready = false;
   if (cedar_engine) {
     cedar_engine_free(cedar_engine);
     cedar_engine = NULL;
@@ -1221,6 +1242,7 @@ Datum pg_cedar_set_policies(PG_FUNCTION_ARGS) {
   SPI_finish();
 
   /* Reload the engine */
+  cedar_engine_ready = false;
   cedar_engine_loaded = false;
   ensure_cedar_engine();
 
@@ -1266,6 +1288,7 @@ Datum pg_cedar_set_schema(PG_FUNCTION_ARGS) {
 
   SPI_finish();
 
+  cedar_engine_ready = false;
   cedar_engine_loaded = false;
   ensure_cedar_engine();
   reset_auth_cache();
@@ -1307,6 +1330,7 @@ Datum pg_cedar_set_entities(PG_FUNCTION_ARGS) {
 
   SPI_finish();
 
+  cedar_engine_ready = false;
   cedar_engine_loaded = false;
   ensure_cedar_engine();
   reset_auth_cache();
@@ -1410,6 +1434,7 @@ Datum pg_cedar_explain_decision(PG_FUNCTION_ARGS) {
 }
 
 Datum pg_cedar_reload(PG_FUNCTION_ARGS) {
+  cedar_engine_ready = false;
   cedar_engine_loaded = false;
 
   if (cedar_engine) {
