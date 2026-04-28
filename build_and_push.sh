@@ -10,6 +10,27 @@ IMAGE_NAME="${IMAGE_NAME:-postgres-cedar}"
 TAG="${TAG:-latest}"
 FULL_IMAGE_NAME="${REGISTRY}/${IMAGE_NAME}:${TAG}"
 
+resolve_latest_libcedar_version() {
+    local latest_release_url resolved_url release_tag
+    latest_release_url="https://github.com/lurkingryuu/libcedar/releases/latest"
+    resolved_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "${latest_release_url}")"
+    release_tag="${resolved_url##*/}"
+
+    if [ -z "${release_tag}" ] || [ "${release_tag}" = "latest" ]; then
+        echo "Failed to resolve the latest libcedar release from GitHub" >&2
+        return 1
+    fi
+
+    printf '%s\n' "${release_tag}"
+}
+
+DEFAULT_LIBCEDAR_VERSION="${DEFAULT_LIBCEDAR_VERSION:-v0.1.0}"
+if [ -z "${LIBCEDAR_VERSION:-}" ]; then
+    LIBCEDAR_VERSION="${DEFAULT_LIBCEDAR_VERSION}"
+elif [ "${LIBCEDAR_VERSION}" = "latest" ]; then
+    LIBCEDAR_VERSION="$(resolve_latest_libcedar_version)"
+fi
+
 # Parse flags
 NATIVE_ONLY=false
 for arg in "$@"; do
@@ -31,6 +52,7 @@ echo "Registry: ${REGISTRY}"
 echo "Image: ${IMAGE_NAME}"
 echo "Tag: ${TAG}"
 echo "Full image: ${FULL_IMAGE_NAME}"
+echo "libcedar release: ${LIBCEDAR_VERSION}"
 echo "Mode: $([ "$NATIVE_ONLY" = true ] && echo 'native (single-arch)' || echo 'multi-arch (amd64 + arm64)')"
 echo ""
 
@@ -72,7 +94,9 @@ if [ "$NATIVE_ONLY" = true ]; then
     echo "Building and pushing native image..."
     echo "Platform: ${NATIVE_PLATFORM}"
     echo "Command: docker buildx build --platform ${NATIVE_PLATFORM} --push -f postgres-cedar.Dockerfile -t ${FULL_IMAGE_NAME} ."
-    docker buildx build --platform "${NATIVE_PLATFORM}" --push -f postgres-cedar.Dockerfile -t "${FULL_IMAGE_NAME}" .
+    docker buildx build --platform "${NATIVE_PLATFORM}" --push \
+      --build-arg "LIBCEDAR_VERSION=${LIBCEDAR_VERSION}" \
+      -f postgres-cedar.Dockerfile -t "${FULL_IMAGE_NAME}" .
     BUILD_PLATFORMS="${NATIVE_PLATFORM}"
 else
     echo "Building and pushing multi-arch Docker image..."
@@ -80,7 +104,9 @@ else
     echo "Command: docker buildx build --platform linux/amd64,linux/arm64 --push -f postgres-cedar.Dockerfile -t ${FULL_IMAGE_NAME} ."
     echo "Note: This multi-arch build can take 20-30 minutes. It builds for both AMD64 and ARM64 architectures."
     echo "Tip: Using buildx for faster multi-platform builds with BuildKit."
-    docker buildx build --platform linux/amd64,linux/arm64 --push -f postgres-cedar.Dockerfile -t "${FULL_IMAGE_NAME}" .
+    docker buildx build --platform linux/amd64,linux/arm64 --push \
+      --build-arg "LIBCEDAR_VERSION=${LIBCEDAR_VERSION}" \
+      -f postgres-cedar.Dockerfile -t "${FULL_IMAGE_NAME}" .
     BUILD_PLATFORMS="linux/amd64, linux/arm64"
 fi
 

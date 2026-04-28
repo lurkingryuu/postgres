@@ -1,2 +1,1 @@
-# Cloned libcedar repo (auto-fetched during build)
-/libcedar/
+# pg_cedar now consumes an installed libcedar package, not a cloned checkout.

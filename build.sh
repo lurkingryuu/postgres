@@ -99,6 +99,8 @@ esac
 
 command -v meson >/dev/null 2>&1 || die "meson not found in PATH"
 command -v ninja >/dev/null 2>&1 || die "ninja not found in PATH"
+command -v pkg-config >/dev/null 2>&1 || die "pkg-config not found in PATH"
+pkg-config --exists libcedar || die "libcedar package not found via pkg-config. Install libcedar and set PKG_CONFIG_PATH if needed."
 
 log "Using PG_SRC_DIR=${PG_SRC_DIR}"
 log "Using PG_PREFIX=${PG_PREFIX}"

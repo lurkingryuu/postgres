@@ -2,51 +2,10 @@
 #
 # pg_cedar — Embedded Cedar authorization engine for PostgreSQL
 #
-# This extension requires libcedar (C bindings for the Cedar policy engine).
-# Build libcedar first:
-#   git clone https://github.com/lurkingryuu/libcedar.git
-#   cd libcedar && cargo build --release
-#
-# Then configure with: -Dlibcedar_dir=/path/to/libcedar
-
-# Allow user to specify libcedar location
-libcedar_dir = get_option('libcedar_dir')
-if libcedar_dir == ''
-  # Try a few common locations
-  candidate_dirs = [
-    meson.current_source_dir() / 'libcedar',
-    meson.source_root() / '..' / 'libcedar',
-  ]
-  foreach d : candidate_dirs
-    if fs.is_file(d / 'include' / 'libcedar.h')
-      libcedar_dir = d
-      break
-    endif
-  endforeach
-endif
-
-if libcedar_dir == ''
-  warning('libcedar not found — pg_cedar will not be built. Clone from https://github.com/lurkingryuu/libcedar.git')
-  subdir_done()
-endif
-
-if libcedar_dir == meson.current_source_dir() / 'libcedar'
-  libcedar_inc = include_directories('libcedar/include')
-else
-  libcedar_inc = include_directories(libcedar_dir / 'include')
-endif
-
-# Declare the static library as an external dependency
-libcedar_lib = declare_dependency(
-  include_directories: libcedar_inc,
-  dependencies: [
-    cc.find_library('cedar', dirs: [libcedar_dir / 'target' / 'release'], static: true),
-    cc.find_library('m'),
-    cc.find_library('dl'),
-    cc.find_library('pthread'),
-    cc.find_library('resolv'),
-  ],
-)
+# This extension requires an installed libcedar package discoverable via
+# pkg-config. Set PKG_CONFIG_PATH when libcedar is installed in a non-default
+# prefix.
+libcedar_lib = dependency('libcedar', method: 'pkg-config', required: true)
 
 pg_cedar_sources = files('pg_cedar.c')
 
